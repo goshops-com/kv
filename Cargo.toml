@@ -1,0 +1,56 @@
+[package]
+name = "tieredkv"
+version = "0.1.0"
+edition = "2021"
+description = "A tiered key-value store with memory, disk, and object storage layers"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# HTTP framework
+axum = { version = "0.7", features = ["macros"] }
+tower = { version = "0.4", features = ["util"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Disk storage - using sled for simpler setup (pure Rust)
+sled = "0.34"
+
+# Object storage - simplified S3 client
+rusoto_core = { version = "0.48", optional = true }
+rusoto_s3 = { version = "0.48", optional = true }
+
+# Hashing for sharding
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# Utilities
+bytes = "1.5"
+parking_lot = "0.12"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Async traits
+async-trait = "0.1"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# UUID for unique IDs
+uuid = { version = "1.6", features = ["v4"] }
+
+# HTTP client for replication
+reqwest = { version = "0.11", features = ["json"], default-features = false, optional = true }
+
+[features]
+default = []
+s3 = ["rusoto_core", "rusoto_s3"]
+replication = ["reqwest"]
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3.9"

@@ -1,0 +1,12 @@
+# PodDisruptionBudget to ensure availability during updates
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: tieredkv-pdb
+  labels:
+    app: tieredkv
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: tieredkv

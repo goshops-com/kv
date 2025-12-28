@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: tieredkv
+  labels:
+    app: tieredkv
+spec:
+  serviceName: tieredkv-headless
+  # Number of shards - each pod is one shard
+  # Increase this to add more shards
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: tieredkv
+  template:
+    metadata:
+      labels:
+        app: tieredkv
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: tieredkv
+          image: tieredkv:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: tieredkv-config
+          env:
+            # Shard ID is derived from pod ordinal index
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: SHARD_ID
+              value: "$(POD_NAME)"
+            # Total shards must match replicas count
+            - name: TOTAL_SHARDS
+              value: "3"
+            # S3 credentials from secret
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: tieredkv-s3-credentials
+                  key: access-key-id
+                  optional: true
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: tieredkv-s3-credentials
+                  key: secret-access-key
+                  optional: true
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "2000m"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 100Gi
+        # Use your cluster's storage class
+        # storageClassName: standard

@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tieredkv-config
+  labels:
+    app: tieredkv
+data:
+  # Memory cache settings
+  MEMORY_MAX_SIZE_MB: "256"
+  MEMORY_MAX_ENTRIES: "100000"
+
+  # Disk settings
+  DISK_MAX_SIZE_GB: "50"
+  DISK_MIGRATION_AGE_HOURS: "24"
+
+  # Object storage settings
+  S3_BUCKET: "tieredkv-data"
+  S3_REGION: "us-east-1"
+  S3_PREFIX: "data/"
+
+  # Sharding settings (will be overridden by StatefulSet)
+  VIRTUAL_NODES: "150"
+
+  # Replication settings
+  REPLICATION_BATCH_SIZE: "100"
+  REPLICATION_MAX_LAG_MS: "1000"
+
+  # Server settings
+  HTTP_PORT: "8080"
+  RUST_LOG: "info"

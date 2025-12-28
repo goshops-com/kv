@@ -1,0 +1,33 @@
+---
+# Headless service for internal discovery between shards
+apiVersion: v1
+kind: Service
+metadata:
+  name: tieredkv-headless
+  labels:
+    app: tieredkv
+spec:
+  clusterIP: None
+  selector:
+    app: tieredkv
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+
+---
+# ClusterIP service for external access (load balanced across all shards)
+apiVersion: v1
+kind: Service
+metadata:
+  name: tieredkv
+  labels:
+    app: tieredkv
+spec:
+  type: ClusterIP
+  selector:
+    app: tieredkv
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
