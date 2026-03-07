@@ -12,29 +12,52 @@ use tower_http::trace::TraceLayer;
 use super::handlers;
 use crate::engine::TieredEngine;
 
-/// Shared state for the API
-pub struct ApiState {
+/// Shared application state
+#[derive(Clone)]
+pub struct AppState {
     pub engine: Arc<TieredEngine>,
+    #[cfg(feature = "cluster")]
+    pub shard: Option<Arc<ShardState>>,
+}
+
+/// Shard routing state (only with cluster feature)
+#[cfg(feature = "cluster")]
+#[derive(Clone)]
+pub struct ShardState {
+    pub router: crate::cluster::ShardRouter,
+    pub http_client: reqwest::Client,
+    /// Service name template, e.g. "tieredkv-{}.tieredkv.default.svc.cluster.local"
+    pub service_template: String,
+    pub port: u16,
+}
+
+#[cfg(feature = "cluster")]
+impl ShardState {
+    /// Get the URL for a given shard
+    pub fn shard_url(&self, shard_id: u32, path: &str) -> String {
+        let host = self.service_template.replace("{}", &shard_id.to_string());
+        format!("http://{}:{}{}", host, self.port, path)
+    }
 }
 
 /// Create the API router with all routes
-pub fn create_router(engine: Arc<TieredEngine>) -> Router {
+pub fn create_router(state: AppState) -> Router {
     Router::new()
         // Health and stats
         .route("/health", get(handlers::health))
         .route("/stats", get(handlers::stats))
         // Key-value operations
-        .route("/kv/:key", get(handlers::get_key))
-        .route("/kv/:key", put(handlers::put_key))
-        .route("/kv/:key", delete(handlers::delete_key))
-        .route("/kv/:key", head(handlers::head_key))
+        .route("/kv/*key", get(handlers::get_key))
+        .route("/kv/*key", put(handlers::put_key))
+        .route("/kv/*key", delete(handlers::delete_key))
+        .route("/kv/*key", head(handlers::head_key))
         // Admin operations
         .route("/admin/migrate", post(handlers::trigger_migration))
         .route("/admin/flush", post(handlers::flush))
         // Middleware
         .layer(TraceLayer::new_for_http())
         // State
-        .with_state(engine)
+        .with_state(state)
 }
 
 #[cfg(test)]
@@ -61,7 +84,12 @@ mod tests {
         };
 
         let engine = Arc::new(TieredEngine::with_config(config).unwrap());
-        let router = create_router(engine);
+        let state = AppState {
+            engine,
+            #[cfg(feature = "cluster")]
+            shard: None,
+        };
+        let router = create_router(state);
 
         (router, temp_dir)
     }
@@ -122,7 +150,12 @@ mod tests {
             ..Default::default()
         };
         let engine = Arc::new(TieredEngine::with_config(config).unwrap());
-        let app = create_router(engine);
+        let state = AppState {
+            engine,
+            #[cfg(feature = "cluster")]
+            shard: None,
+        };
+        let app = create_router(state);
 
         // PUT a key
         let put_response = app
@@ -189,7 +222,12 @@ mod tests {
             ..Default::default()
         };
         let engine = Arc::new(TieredEngine::with_config(config).unwrap());
-        let app = create_router(engine);
+        let state = AppState {
+            engine,
+            #[cfg(feature = "cluster")]
+            shard: None,
+        };
+        let app = create_router(state);
 
         // PUT a key
         app.clone()
@@ -249,7 +287,12 @@ mod tests {
             ..Default::default()
         };
         let engine = Arc::new(TieredEngine::with_config(config).unwrap());
-        let app = create_router(engine);
+        let state = AppState {
+            engine,
+            #[cfg(feature = "cluster")]
+            shard: None,
+        };
+        let app = create_router(state);
 
         // HEAD non-existent key
         let head_response = app

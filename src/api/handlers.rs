@@ -1,27 +1,28 @@
 //! HTTP API Handlers
 //!
 //! REST endpoints for the tiered key-value store.
+//! When cluster feature is enabled, handlers proxy requests
+//! to the correct shard if the key doesn't belong to this node.
 
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::IntoResponse,
     Json,
 };
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
-use crate::engine::{EngineStats, StorageTier, TieredEngine};
+use super::server::AppState;
+use crate::engine::StorageTier;
 
 /// Request body for PUT operations
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct PutRequest {
     pub value: String,
 }
 
 /// Response for GET operations
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct GetResponse {
     pub key: String,
     pub value: String,
@@ -29,7 +30,7 @@ pub struct GetResponse {
 }
 
 /// Response for DELETE operations
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct DeleteResponse {
     pub key: String,
     pub deleted: bool,
@@ -55,7 +56,7 @@ pub struct StatsResponse {
 }
 
 /// Error response
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub error: String,
     pub code: String,
@@ -80,8 +81,8 @@ pub async fn health() -> Json<HealthResponse> {
 }
 
 /// GET /stats - Get engine statistics
-pub async fn stats(State(engine): State<Arc<TieredEngine>>) -> Json<StatsResponse> {
-    let stats = engine.stats().await;
+pub async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
+    let stats = state.engine.stats().await;
     let hit_rate = if stats.memory_hits + stats.memory_misses > 0 {
         stats.memory_hits as f64 / (stats.memory_hits + stats.memory_misses) as f64
     } else {
@@ -94,17 +95,44 @@ pub async fn stats(State(engine): State<Arc<TieredEngine>>) -> Json<StatsRespons
         memory_hit_rate: hit_rate,
         disk_entries: stats.disk_entries,
         disk_size_bytes: stats.disk_size_bytes,
-        disk_usage_percent: engine.disk_usage_percent(),
+        disk_usage_percent: state.engine.disk_usage_percent(),
         migrations_completed: stats.migrations_completed,
     })
 }
 
-/// GET /kv/:key - Get a value by key
+/// Strip leading slash from wildcard path capture
+fn normalize_key(key: String) -> String {
+    key.strip_prefix('/').map(String::from).unwrap_or(key)
+}
+
+/// GET /kv/*key - Get a value by key
 pub async fn get_key(
-    State(engine): State<Arc<TieredEngine>>,
-    Path(key): Path<String>,
+    State(state): State<AppState>,
+    Path(raw_key): Path<String>,
 ) -> Result<Json<GetResponse>, (StatusCode, Json<ErrorResponse>)> {
-    match engine.get(key.as_bytes()).await {
+    let key = normalize_key(raw_key);
+    // Check if we should proxy to another shard
+    #[cfg(feature = "cluster")]
+    if let Some(ref shard) = state.shard {
+        if !shard.router.owns_key(key.as_bytes()) {
+            let target_shard = shard.router.get_shard(key.as_bytes());
+            let url = shard.shard_url(target_shard, &format!("/kv/{}", key));
+
+            return match shard.http_client.get(&url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    let body: GetResponse = resp.json().await.map_err(|e| proxy_error(e))?;
+                    Ok(Json(body))
+                }
+                Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+                    Err(not_found(&key))
+                }
+                Ok(resp) => Err(proxy_status_error(resp.status().as_u16())),
+                Err(e) => Err(proxy_error(e)),
+            };
+        }
+    }
+
+    match state.engine.get(key.as_bytes()).await {
         Ok(Some(entry)) => {
             let value = String::from_utf8_lossy(&entry.value).to_string();
             Ok(Json(GetResponse {
@@ -113,13 +141,7 @@ pub async fn get_key(
                 tier: entry.tier.into(),
             }))
         }
-        Ok(None) => Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("Key '{}' not found", key),
-                code: "KEY_NOT_FOUND".to_string(),
-            }),
-        )),
+        Ok(None) => Err(not_found(&key)),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -130,13 +152,29 @@ pub async fn get_key(
     }
 }
 
-/// PUT /kv/:key - Set a value
+/// PUT /kv/*key - Set a value
 pub async fn put_key(
-    State(engine): State<Arc<TieredEngine>>,
-    Path(key): Path<String>,
+    State(state): State<AppState>,
+    Path(raw_key): Path<String>,
     Json(body): Json<PutRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    match engine.put(key.as_bytes(), Bytes::from(body.value)).await {
+    let key = normalize_key(raw_key);
+    // Check if we should proxy to another shard
+    #[cfg(feature = "cluster")]
+    if let Some(ref shard) = state.shard {
+        if !shard.router.owns_key(key.as_bytes()) {
+            let target_shard = shard.router.get_shard(key.as_bytes());
+            let url = shard.shard_url(target_shard, &format!("/kv/{}", key));
+
+            return match shard.http_client.put(&url).json(&body).send().await {
+                Ok(resp) if resp.status().is_success() => Ok(StatusCode::CREATED),
+                Ok(resp) => Err(proxy_status_error(resp.status().as_u16())),
+                Err(e) => Err(proxy_error(e)),
+            };
+        }
+    }
+
+    match state.engine.put(key.as_bytes(), Bytes::from(body.value)).await {
         Ok(()) => Ok(StatusCode::CREATED),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -150,10 +188,29 @@ pub async fn put_key(
 
 /// DELETE /kv/:key - Delete a value
 pub async fn delete_key(
-    State(engine): State<Arc<TieredEngine>>,
-    Path(key): Path<String>,
+    State(state): State<AppState>,
+    Path(raw_key): Path<String>,
 ) -> Result<Json<DeleteResponse>, (StatusCode, Json<ErrorResponse>)> {
-    match engine.delete(key.as_bytes()).await {
+    let key = normalize_key(raw_key);
+    // Check if we should proxy to another shard
+    #[cfg(feature = "cluster")]
+    if let Some(ref shard) = state.shard {
+        if !shard.router.owns_key(key.as_bytes()) {
+            let target_shard = shard.router.get_shard(key.as_bytes());
+            let url = shard.shard_url(target_shard, &format!("/kv/{}", key));
+
+            return match shard.http_client.delete(&url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    let body: DeleteResponse = resp.json().await.map_err(|e| proxy_error(e))?;
+                    Ok(Json(body))
+                }
+                Ok(resp) => Err(proxy_status_error(resp.status().as_u16())),
+                Err(e) => Err(proxy_error(e)),
+            };
+        }
+    }
+
+    match state.engine.delete(key.as_bytes()).await {
         Ok(deleted) => Ok(Json(DeleteResponse { key, deleted })),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -167,10 +224,26 @@ pub async fn delete_key(
 
 /// HEAD /kv/:key - Check if a key exists
 pub async fn head_key(
-    State(engine): State<Arc<TieredEngine>>,
-    Path(key): Path<String>,
+    State(state): State<AppState>,
+    Path(raw_key): Path<String>,
 ) -> StatusCode {
-    match engine.contains(key.as_bytes()).await {
+    let key = normalize_key(raw_key);
+    // Check if we should proxy to another shard
+    #[cfg(feature = "cluster")]
+    if let Some(ref shard) = state.shard {
+        if !shard.router.owns_key(key.as_bytes()) {
+            let target_shard = shard.router.get_shard(key.as_bytes());
+            let url = shard.shard_url(target_shard, &format!("/kv/{}", key));
+
+            return match shard.http_client.head(&url).send().await {
+                Ok(resp) => StatusCode::from_u16(resp.status().as_u16())
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+        }
+    }
+
+    match state.engine.contains(key.as_bytes()).await {
         Ok(true) => StatusCode::OK,
         Ok(false) => StatusCode::NOT_FOUND,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -179,9 +252,9 @@ pub async fn head_key(
 
 /// POST /admin/migrate - Trigger migration manually
 pub async fn trigger_migration(
-    State(engine): State<Arc<TieredEngine>>,
+    State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    match engine.run_migration().await {
+    match state.engine.run_migration().await {
         Ok(count) => Ok(Json(serde_json::json!({
             "migrated": count,
             "message": format!("Migrated {} entries to object storage", count)
@@ -198,9 +271,9 @@ pub async fn trigger_migration(
 
 /// POST /admin/flush - Flush disk to ensure durability
 pub async fn flush(
-    State(engine): State<Arc<TieredEngine>>,
+    State(state): State<AppState>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    match engine.flush() {
+    match state.engine.flush() {
         Ok(()) => Ok(StatusCode::OK),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -210,4 +283,36 @@ pub async fn flush(
             }),
         )),
     }
+}
+
+fn not_found(key: &str) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: format!("Key '{}' not found", key),
+            code: "KEY_NOT_FOUND".to_string(),
+        }),
+    )
+}
+
+#[cfg(feature = "cluster")]
+fn proxy_error(e: impl std::fmt::Display) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(ErrorResponse {
+            error: format!("Shard proxy error: {}", e),
+            code: "PROXY_ERROR".to_string(),
+        }),
+    )
+}
+
+#[cfg(feature = "cluster")]
+fn proxy_status_error(status: u16) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(ErrorResponse {
+            error: format!("Shard returned status {}", status),
+            code: "PROXY_ERROR".to_string(),
+        }),
+    )
 }
