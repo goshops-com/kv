@@ -111,24 +111,11 @@ pub async fn get_key(
     Path(raw_key): Path<String>,
 ) -> Result<Json<GetResponse>, (StatusCode, Json<ErrorResponse>)> {
     let key = normalize_key(raw_key);
-    // Check if we should proxy to another shard
+    // With client-side routing, reject keys that don't belong to this shard
     #[cfg(feature = "cluster")]
     if let Some(ref shard) = state.shard {
         if !shard.router.owns_key(key.as_bytes()) {
-            let target_shard = shard.router.get_shard(key.as_bytes());
-            let url = shard.shard_url(target_shard, &format!("/kv/{}", key));
-
-            return match shard.http_client.get(&url).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    let body: GetResponse = resp.json().await.map_err(|e| proxy_error(e))?;
-                    Ok(Json(body))
-                }
-                Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
-                    Err(not_found(&key))
-                }
-                Ok(resp) => Err(proxy_status_error(resp.status().as_u16())),
-                Err(e) => Err(proxy_error(e)),
-            };
+            return Err(not_found(&key));
         }
     }
 
@@ -159,18 +146,17 @@ pub async fn put_key(
     Json(body): Json<PutRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     let key = normalize_key(raw_key);
-    // Check if we should proxy to another shard
+    // With client-side routing, reject keys that don't belong to this shard
     #[cfg(feature = "cluster")]
     if let Some(ref shard) = state.shard {
         if !shard.router.owns_key(key.as_bytes()) {
-            let target_shard = shard.router.get_shard(key.as_bytes());
-            let url = shard.shard_url(target_shard, &format!("/kv/{}", key));
-
-            return match shard.http_client.put(&url).json(&body).send().await {
-                Ok(resp) if resp.status().is_success() => Ok(StatusCode::CREATED),
-                Ok(resp) => Err(proxy_status_error(resp.status().as_u16())),
-                Err(e) => Err(proxy_error(e)),
-            };
+            return Err((
+                StatusCode::MISDIRECTED_REQUEST,
+                Json(ErrorResponse {
+                    error: "Wrong shard".to_string(),
+                    code: "WRONG_SHARD".to_string(),
+                }),
+            ));
         }
     }
 
@@ -192,21 +178,11 @@ pub async fn delete_key(
     Path(raw_key): Path<String>,
 ) -> Result<Json<DeleteResponse>, (StatusCode, Json<ErrorResponse>)> {
     let key = normalize_key(raw_key);
-    // Check if we should proxy to another shard
+    // With client-side routing, reject keys that don't belong to this shard
     #[cfg(feature = "cluster")]
     if let Some(ref shard) = state.shard {
         if !shard.router.owns_key(key.as_bytes()) {
-            let target_shard = shard.router.get_shard(key.as_bytes());
-            let url = shard.shard_url(target_shard, &format!("/kv/{}", key));
-
-            return match shard.http_client.delete(&url).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    let body: DeleteResponse = resp.json().await.map_err(|e| proxy_error(e))?;
-                    Ok(Json(body))
-                }
-                Ok(resp) => Err(proxy_status_error(resp.status().as_u16())),
-                Err(e) => Err(proxy_error(e)),
-            };
+            return Err(not_found(&key));
         }
     }
 
@@ -228,18 +204,11 @@ pub async fn head_key(
     Path(raw_key): Path<String>,
 ) -> StatusCode {
     let key = normalize_key(raw_key);
-    // Check if we should proxy to another shard
+    // With client-side routing, reject keys that don't belong to this shard
     #[cfg(feature = "cluster")]
     if let Some(ref shard) = state.shard {
         if !shard.router.owns_key(key.as_bytes()) {
-            let target_shard = shard.router.get_shard(key.as_bytes());
-            let url = shard.shard_url(target_shard, &format!("/kv/{}", key));
-
-            return match shard.http_client.head(&url).send().await {
-                Ok(resp) => StatusCode::from_u16(resp.status().as_u16())
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            };
+            return StatusCode::NOT_FOUND;
         }
     }
 
