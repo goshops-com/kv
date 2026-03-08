@@ -1,9 +1,10 @@
 //! Disk Store Layer (L2)
 //!
-//! Persistent local storage using sled (LSM-tree based, pure Rust)
+//! Persistent local storage using RocksDB with zstd compression
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use rocksdb::{Options, DB};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,8 +13,8 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum DiskError {
-    #[error("Sled error: {0}")]
-    Sled(#[from] sled::Error),
+    #[error("RocksDB error: {0}")]
+    Rocks(#[from] rocksdb::Error),
     #[error("Serialization error: {0}")]
     Serialization(String),
     #[error("Key not found")]
@@ -50,15 +51,28 @@ pub struct StoredEntry {
     pub value: Vec<u8>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub ttl_secs: Option<u64>,
 }
 
 impl StoredEntry {
-    fn new(value: Vec<u8>) -> Self {
+    pub(crate) fn new(value: Vec<u8>) -> Self {
         let now = Utc::now();
         Self {
             value,
             created_at: now,
             updated_at: now,
+            ttl_secs: None,
+        }
+    }
+
+    pub(crate) fn new_with_ttl(value: Vec<u8>, ttl_secs: Option<u64>) -> Self {
+        let now = Utc::now();
+        Self {
+            value,
+            created_at: now,
+            updated_at: now,
+            ttl_secs,
         }
     }
 
@@ -102,18 +116,37 @@ pub enum MigrationReason {
     SpacePressure,
 }
 
-/// Disk storage layer using sled
+/// Disk storage layer using RocksDB
 pub struct DiskStore {
-    db: sled::Db,
+    db: DB,
     config: DiskConfig,
     write_count: AtomicU64,
     total_size: AtomicU64,
 }
 
+fn make_opts() -> Options {
+    let mut opts = Options::default();
+    opts.create_if_missing(true);
+    opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
+    // Limit block cache to 64MB — controls RSS usage
+    let cache = rocksdb::Cache::new_lru_cache(64 * 1024 * 1024);
+    let mut block_opts = rocksdb::BlockBasedOptions::default();
+    block_opts.set_block_cache(&cache);
+    block_opts.set_block_size(16 * 1024); // 16KB blocks, good for large values
+    opts.set_block_based_table_factory(&block_opts);
+    // Write buffer: 32MB before flushing to SST
+    opts.set_write_buffer_size(32 * 1024 * 1024);
+    opts.set_max_write_buffer_number(2);
+    // Limit total WAL size
+    opts.set_max_total_wal_size(64 * 1024 * 1024);
+    opts
+}
+
 impl DiskStore {
     /// Create a new disk store
     pub fn new(config: DiskConfig) -> Result<Self, DiskError> {
-        let db = sled::open(&config.data_dir)?;
+        let opts = make_opts();
+        let db = DB::open(&opts, &config.data_dir)?;
 
         // Calculate initial size
         let total_size = Self::calculate_size(&db);
@@ -135,9 +168,9 @@ impl DiskStore {
         Self::new(config)
     }
 
-    fn calculate_size(db: &sled::Db) -> u64 {
-        db.iter()
-            .filter_map(|r| r.ok())
+    fn calculate_size(db: &DB) -> u64 {
+        let iter = db.iterator(rocksdb::IteratorMode::Start);
+        iter.filter_map(|r| r.ok())
             .map(|(_, v)| v.len() as u64)
             .sum()
     }
@@ -156,7 +189,11 @@ impl DiskStore {
 
     /// Put a value to disk (durable write)
     pub fn put(&self, key: &[u8], value: Bytes) -> Result<Option<DiskEntry>, DiskError> {
-        let entry = StoredEntry::new(value.to_vec());
+        self.put_with_ttl(key, value, None)
+    }
+
+    pub fn put_with_ttl(&self, key: &[u8], value: Bytes, ttl_secs: Option<u64>) -> Result<Option<DiskEntry>, DiskError> {
+        let entry = StoredEntry::new_with_ttl(value.to_vec(), ttl_secs);
         let serialized = serde_json::to_vec(&entry)
             .map_err(|e| DiskError::Serialization(e.to_string()))?;
 
@@ -168,7 +205,10 @@ impl DiskStore {
 
         let new_size = serialized.len() as u64;
 
-        let old = self.db.insert(key, serialized)?;
+        // Read old value before overwriting
+        let old = self.db.get(key)?;
+
+        self.db.put(key, &serialized)?;
 
         // Update total size atomically
         let size_diff = new_size as i64 - old_size as i64;
@@ -199,8 +239,10 @@ impl DiskStore {
 
     /// Delete a value from disk
     pub fn delete(&self, key: &[u8]) -> Result<Option<DiskEntry>, DiskError> {
-        match self.db.remove(key)? {
+        match self.db.get(key)? {
             Some(data) => {
+                self.db.delete(key)?;
+
                 let stored: StoredEntry = serde_json::from_slice(&data)
                     .map_err(|e| DiskError::Serialization(e.to_string()))?;
 
@@ -215,7 +257,7 @@ impl DiskStore {
 
     /// Check if a key exists
     pub fn contains(&self, key: &[u8]) -> Result<bool, DiskError> {
-        Ok(self.db.contains_key(key)?)
+        Ok(self.db.get(key)?.is_some())
     }
 
     /// Force flush to disk
@@ -231,12 +273,13 @@ impl DiskStore {
 
     /// Get number of entries
     pub fn len(&self) -> usize {
-        self.db.len()
+        let iter = self.db.iterator(rocksdb::IteratorMode::Start);
+        iter.filter_map(|r| r.ok()).count()
     }
 
     /// Check if store is empty
     pub fn is_empty(&self) -> bool {
-        self.db.is_empty()
+        self.len() == 0
     }
 
     /// Get disk usage as a percentage of max size
@@ -246,10 +289,20 @@ impl DiskStore {
         (size / max) * 100.0
     }
 
+    /// Iterate over all entries with their keys and metadata
+    pub fn db_iter(&self) -> impl Iterator<Item = Result<(Vec<u8>, StoredEntry), DiskError>> + '_ {
+        self.db.iterator(rocksdb::IteratorMode::Start).map(|result| {
+            let (key, data) = result.map_err(DiskError::from)?;
+            let entry: StoredEntry = serde_json::from_slice(&data)
+                .map_err(|e| DiskError::Serialization(e.to_string()))?;
+            Ok((key.to_vec(), entry))
+        })
+    }
+
     /// Iterate over all keys
     pub fn keys(&self) -> impl Iterator<Item = Bytes> + '_ {
         self.db
-            .iter()
+            .iterator(rocksdb::IteratorMode::Start)
             .filter_map(|r| r.ok())
             .map(|(k, _)| Bytes::copy_from_slice(&k))
     }
@@ -262,7 +315,7 @@ impl DiskStore {
 
         let mut candidates = Vec::new();
 
-        for result in self.db.iter() {
+        for result in self.db.iterator(rocksdb::IteratorMode::Start) {
             if candidates.len() >= limit {
                 break;
             }
@@ -528,7 +581,6 @@ mod tests {
         let keys: Vec<Bytes> = store.keys().collect();
         assert_eq!(keys.len(), 3);
 
-        // Note: sled maintains lexicographic order
         assert!(keys.contains(&Bytes::from("key1")));
         assert!(keys.contains(&Bytes::from("key2")));
         assert!(keys.contains(&Bytes::from("key3")));

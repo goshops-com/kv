@@ -4,7 +4,7 @@
 //! key-value store with automatic data tiering.
 
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -26,6 +26,13 @@ pub enum EngineError {
     NotInitialized,
 }
 
+/// A TTL rule: keys starting with `prefix` expire after `ttl_secs`
+#[derive(Debug, Clone)]
+pub struct TtlRule {
+    pub prefix: String,
+    pub ttl_secs: u64,
+}
+
 /// Configuration for the tiered engine
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -36,6 +43,8 @@ pub struct EngineConfig {
     pub migration_batch_size: usize,
     /// Disk usage threshold (%) that triggers migration
     pub migration_threshold_percent: f64,
+    /// TTL rules by key prefix. Keys not matching any rule live forever.
+    pub ttl_rules: Vec<TtlRule>,
 }
 
 impl Default for EngineConfig {
@@ -46,6 +55,7 @@ impl Default for EngineConfig {
             object: ObjectConfig::default(),
             migration_batch_size: 100,
             migration_threshold_percent: 80.0,
+            ttl_rules: vec![],
         }
     }
 }
@@ -170,11 +180,15 @@ impl TieredEngine {
     /// Write path: Memory + Disk → ACK
     /// The durability guarantee is satisfied when disk write completes.
     pub async fn put(&self, key: &[u8], value: Bytes) -> Result<(), EngineError> {
+        self.put_with_ttl(key, value, None).await
+    }
+
+    pub async fn put_with_ttl(&self, key: &[u8], value: Bytes, ttl_secs: Option<u64>) -> Result<(), EngineError> {
         let key_str = String::from_utf8_lossy(key);
         debug!(key = %key_str, size = value.len(), "Putting key");
 
         // Write to disk first (durability)
-        self.disk.put(key, value.clone())?;
+        self.disk.put_with_ttl(key, value.clone(), ttl_secs)?;
 
         // Update cache
         let evicted = self.memory.put(key, value);
@@ -292,6 +306,62 @@ impl TieredEngine {
         Ok(removed)
     }
 
+    /// Run TTL cleanup: delete expired entries from all tiers
+    pub async fn run_ttl_cleanup(&self) -> Result<usize, EngineError> {
+        let now = Utc::now();
+        let mut expired_keys: Vec<Bytes> = Vec::new();
+
+        for result in self.disk.db_iter() {
+            let (key_bytes, entry) = match result {
+                Ok(pair) => pair,
+                Err(_) => continue,
+            };
+
+            // Check per-key TTL first
+            if let Some(ttl_secs) = entry.ttl_secs {
+                if now.signed_duration_since(entry.updated_at) > Duration::seconds(ttl_secs as i64) {
+                    expired_keys.push(Bytes::copy_from_slice(&key_bytes));
+                    continue;
+                }
+            }
+
+            // Fall back to prefix-based TTL rules
+            let key_str = String::from_utf8_lossy(&key_bytes);
+            let ttl = self.config.ttl_rules.iter().find_map(|rule| {
+                if key_str.starts_with(&rule.prefix) {
+                    Some(Duration::seconds(rule.ttl_secs as i64))
+                } else {
+                    None
+                }
+            });
+
+            if let Some(ttl) = ttl {
+                if now.signed_duration_since(entry.created_at) > ttl {
+                    expired_keys.push(Bytes::copy_from_slice(&key_bytes));
+                }
+            }
+        }
+
+        if expired_keys.is_empty() {
+            return Ok(0);
+        }
+
+        let count = expired_keys.len();
+        info!(count, "Cleaning up expired entries");
+
+        for key in &expired_keys {
+            // Remove from cache
+            self.memory.delete(key);
+            // Remove from disk
+            let _ = self.disk.delete(key);
+            // Remove from object storage
+            let object_key = Self::to_object_key(key);
+            let _ = self.object.delete(&object_key).await;
+        }
+
+        Ok(count)
+    }
+
     /// Get engine statistics
     pub async fn stats(&self) -> EngineStats {
         let cache_stats = self.memory.stats();
@@ -365,6 +435,7 @@ mod tests {
             object: ObjectConfig::default(),
             migration_batch_size: 10,
             migration_threshold_percent: 80.0,
+            ttl_rules: vec![],
         };
 
         let engine = TieredEngine::with_config(config).unwrap();

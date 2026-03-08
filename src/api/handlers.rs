@@ -19,6 +19,7 @@ use crate::engine::StorageTier;
 #[derive(Debug, Deserialize, Serialize)]
 pub struct PutRequest {
     pub value: String,
+    pub ttl: Option<u64>,
 }
 
 /// Response for GET operations
@@ -160,7 +161,7 @@ pub async fn put_key(
         }
     }
 
-    match state.engine.put(key.as_bytes(), Bytes::from(body.value)).await {
+    match state.engine.put_with_ttl(key.as_bytes(), Bytes::from(body.value), body.ttl).await {
         Ok(()) => Ok(StatusCode::CREATED),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
