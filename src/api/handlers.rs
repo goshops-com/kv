@@ -23,10 +23,11 @@ pub struct PutRequest {
 }
 
 /// Response for GET operations
-#[derive(Debug, Serialize, Deserialize)]
+/// Uses RawValue for the value field to avoid re-serializing JSON-inside-JSON
+#[derive(Debug, Serialize)]
 pub struct GetResponse {
     pub key: String,
-    pub value: String,
+    pub value: Box<serde_json::value::RawValue>,
     pub tier: String,
 }
 
@@ -122,10 +123,18 @@ pub async fn get_key(
 
     match state.engine.get(key.as_bytes()).await {
         Ok(Some(entry)) => {
-            let value = String::from_utf8_lossy(&entry.value).to_string();
+            // Embed value as raw JSON (no re-parsing, no re-escaping of ~287KB)
+            let value_str = String::from_utf8_lossy(&entry.value);
+            let raw = serde_json::value::RawValue::from_string(value_str.into_owned())
+                .unwrap_or_else(|_| {
+                    // Fallback: if value isn't valid JSON, quote it as a JSON string
+                    serde_json::value::RawValue::from_string(
+                        serde_json::to_string(&String::from_utf8_lossy(&entry.value).as_ref()).unwrap()
+                    ).unwrap()
+                });
             Ok(Json(GetResponse {
                 key,
-                value,
+                value: raw,
                 tier: entry.tier.into(),
             }))
         }
