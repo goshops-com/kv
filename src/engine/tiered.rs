@@ -410,6 +410,11 @@ impl TieredEngine {
         Ok(count)
     }
 
+    /// Re-serialize legacy JSON entries to MessagePack format
+    pub fn reserialize_legacy_batch(&self, batch_size: usize) -> Result<usize, EngineError> {
+        Ok(self.disk.reserialize_legacy_batch(batch_size)?)
+    }
+
     /// Get engine statistics
     pub async fn stats(&self) -> EngineStats {
         let cache_stats = self.memory.stats();

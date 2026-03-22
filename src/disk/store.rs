@@ -128,6 +128,29 @@ pub enum MigrationReason {
     SpacePressure,
 }
 
+/// Re-serialize a batch of legacy JSON entries to MessagePack.
+/// Returns the number of entries converted.
+pub fn reserialize_batch(db: &DB, batch_size: usize) -> Result<usize, DiskError> {
+    let mut converted = 0;
+    for result in db.iterator(rocksdb::IteratorMode::Start) {
+        if converted >= batch_size {
+            break;
+        }
+        let (key, data) = result?;
+        // Skip entries already in msgpack format
+        if data.first() == Some(&MSGPACK_VERSION) {
+            continue;
+        }
+        // Deserialize from JSON, re-serialize as msgpack
+        let entry: StoredEntry = serde_json::from_slice(&data)
+            .map_err(|e| DiskError::Serialization(e.to_string()))?;
+        let new_data = serialize_entry(&entry)?;
+        db.put(&key, &new_data)?;
+        converted += 1;
+    }
+    Ok(converted)
+}
+
 /// Version byte for MessagePack serialization (JSON has no prefix, starts with '{')
 const MSGPACK_VERSION: u8 = 0x01;
 
@@ -326,6 +349,11 @@ impl DiskStore {
     /// Check if a key exists
     pub fn contains(&self, key: &[u8]) -> Result<bool, DiskError> {
         Ok(self.db.get(key)?.is_some())
+    }
+
+    /// Re-serialize legacy JSON entries to MessagePack (batch)
+    pub fn reserialize_legacy_batch(&self, batch_size: usize) -> Result<usize, DiskError> {
+        reserialize_batch(&self.db, batch_size)
     }
 
     /// Force flush to disk

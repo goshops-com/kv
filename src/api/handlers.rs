@@ -264,6 +264,40 @@ pub async fn flush(
     }
 }
 
+/// GET /debug/profile?seconds=10 - Generate CPU flamegraph SVG
+pub async fn cpu_profile(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<axum::response::Response, (StatusCode, Json<ErrorResponse>)> {
+    let seconds: u64 = params.get("seconds").and_then(|s| s.parse().ok()).unwrap_or(10);
+    let seconds = seconds.min(60); // cap at 60s
+
+    let guard = pprof::ProfilerGuardBuilder::default()
+        .frequency(99)
+        .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+        .build()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
+            error: e.to_string(), code: "PROFILE_ERROR".to_string(),
+        })))?;
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(seconds)).await;
+
+    let report = guard.report().build().map_err(|e| (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse { error: e.to_string(), code: "PROFILE_ERROR".to_string() }),
+    ))?;
+
+    let mut body = Vec::new();
+    report.flamegraph(&mut body).map_err(|e| (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse { error: e.to_string(), code: "PROFILE_ERROR".to_string() }),
+    ))?;
+
+    Ok(axum::response::Response::builder()
+        .header("content-type", "image/svg+xml")
+        .body(axum::body::Body::from(body))
+        .unwrap())
+}
+
 fn not_found(key: &str) -> (StatusCode, Json<ErrorResponse>) {
     (
         StatusCode::NOT_FOUND,

@@ -54,6 +54,8 @@ pub fn create_router(state: AppState) -> Router {
         // Admin operations
         .route("/admin/migrate", post(handlers::trigger_migration))
         .route("/admin/flush", post(handlers::flush))
+        // Debug/profiling
+        .route("/debug/profile", get(handlers::cpu_profile))
         // Middleware
         .layer(TraceLayer::new_for_http())
         // State
