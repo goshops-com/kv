@@ -355,7 +355,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_migrate_endpoint() {
         let (app, _temp) = create_test_app();
 

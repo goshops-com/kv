@@ -6,24 +6,29 @@ metadata:
     app: tieredkv
 data:
   # Memory cache settings
-  MEMORY_MAX_SIZE_MB: "256"
-  MEMORY_MAX_ENTRIES: "100000"
+  MEMORY_MAX_SIZE_MB: "2048"
+  MEMORY_MAX_ENTRIES: "500000"
 
   # Disk settings
   DISK_MAX_SIZE_GB: "50"
   DISK_MIGRATION_AGE_HOURS: "24"
 
-  # Object storage settings
-  S3_BUCKET: "tieredkv-data"
-  S3_REGION: "us-east-1"
+  # Object storage (Azure Blob)
+  S3_BUCKET: "tieredkv"
   S3_PREFIX: "data/"
 
-  # Sharding settings (will be overridden by StatefulSet)
+  # Sharding settings
   VIRTUAL_NODES: "150"
+  SERVICE_NAME: "tieredkv"
 
-  # Replication settings
-  REPLICATION_BATCH_SIZE: "100"
-  REPLICATION_MAX_LAG_MS: "1000"
+  # Migration settings
+  MIGRATION_BATCH_SIZE: "100"
+  MIGRATION_THRESHOLD_PERCENT: "80"
+  MIGRATION_INTERVAL_SECS: "60"
+
+  # TTL rules: prefix:duration (keys not matching any rule live forever)
+  TTL_RULES: "CAD/:7d"
+  TTL_CLEANUP_INTERVAL_SECS: "300"
 
   # Server settings
   HTTP_PORT: "8080"

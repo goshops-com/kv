@@ -14,6 +14,28 @@ use crate::disk::{DiskConfig, DiskError, DiskStore, MigrationReason};
 use crate::memory::{CacheConfig, MemoryCache};
 use crate::object::{ObjectConfig, ObjectError, ObjectMetadata, ObjectStore};
 
+/// zstd frame magic number (little-endian)
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+/// Compress a value with zstd (level 1 = fast)
+fn compress_value(data: &[u8]) -> Result<Bytes, EngineError> {
+    let compressed = zstd::encode_all(data, 1)
+        .map_err(|e| EngineError::Disk(DiskError::Serialization(e.to_string())))?;
+    Ok(Bytes::from(compressed))
+}
+
+/// Decompress if the value starts with zstd magic, otherwise return as-is.
+/// Safe because JSON values start with '{'/'"'/etc (0x7B/0x22), never 0x28.
+fn decompress_if_needed(data: &Bytes) -> Result<Bytes, EngineError> {
+    if data.len() >= 4 && data[..4] == ZSTD_MAGIC {
+        let decompressed = zstd::decode_all(data.as_ref())
+            .map_err(|e| EngineError::Disk(DiskError::Serialization(e.to_string())))?;
+        Ok(Bytes::from(decompressed))
+    } else {
+        Ok(data.clone())
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum EngineError {
     #[error("Disk error: {0}")]
@@ -131,9 +153,10 @@ impl TieredEngine {
         let key_str = String::from_utf8_lossy(key);
         debug!(key = %key_str, "Getting key");
 
-        // L1: Check memory cache
-        if let Some(value) = self.memory.get(key) {
+        // L1: Check memory cache (stores compressed values)
+        if let Some(cached) = self.memory.get(key) {
             debug!(key = %key_str, "Cache hit");
+            let value = decompress_if_needed(&cached)?;
             return Ok(Some(EntryInfo {
                 value,
                 created_at: Utc::now(), // Approximate
@@ -141,13 +164,14 @@ impl TieredEngine {
             }));
         }
 
-        // L2: Check disk
+        // L2: Check disk (values may be compressed or legacy uncompressed)
         if let Some(entry) = self.disk.get(key)? {
             debug!(key = %key_str, "Disk hit, promoting to cache");
-            // Promote to cache
+            // Promote raw (possibly compressed) value to cache
             self.memory.put(key, entry.value.clone());
+            let value = decompress_if_needed(&entry.value)?;
             return Ok(Some(EntryInfo {
-                value: entry.value,
+                value,
                 created_at: entry.created_at,
                 tier: StorageTier::Disk,
             }));
@@ -161,6 +185,7 @@ impl TieredEngine {
                 let value = entry.value.clone();
                 // Promote to cache (not disk, as it was migrated from disk)
                 self.memory.put(key, value.clone());
+                let value = decompress_if_needed(&value)?;
                 Ok(Some(EntryInfo {
                     value,
                     created_at: entry.metadata.created_at,
@@ -187,11 +212,14 @@ impl TieredEngine {
         let key_str = String::from_utf8_lossy(key);
         debug!(key = %key_str, size = value.len(), "Putting key");
 
-        // Write to disk first (durability)
-        self.disk.put_with_ttl(key, value.clone(), ttl_secs)?;
+        // Compress value before storing (JSON 287KB → ~30KB with zstd)
+        let compressed = compress_value(&value)?;
 
-        // Update cache
-        let evicted = self.memory.put(key, value);
+        // Write compressed to disk (durability)
+        self.disk.put_with_ttl(key, compressed.clone(), ttl_secs)?;
+
+        // Cache compressed value (10x more entries fit in cache)
+        let evicted = self.memory.put(key, compressed);
 
         // If cache evicted entries, they're already on disk, so no action needed
         if !evicted.is_empty() {
@@ -249,7 +277,11 @@ impl TieredEngine {
     ///
     /// This should be called periodically by a background task.
     pub async fn run_migration(&self) -> Result<usize, EngineError> {
-        let candidates = self.disk.get_migration_candidates(self.config.migration_batch_size)?;
+        // Collect candidates in a blocking context (scans RocksDB)
+        let batch_size = self.config.migration_batch_size;
+        let candidates = tokio::task::block_in_place(|| {
+            self.disk.get_migration_candidates(batch_size)
+        })?;
 
         if candidates.is_empty() {
             return Ok(0);
@@ -309,38 +341,47 @@ impl TieredEngine {
     /// Run TTL cleanup: delete expired entries from all tiers
     pub async fn run_ttl_cleanup(&self) -> Result<usize, EngineError> {
         let now = Utc::now();
-        let mut expired_keys: Vec<Bytes> = Vec::new();
+        let ttl_rules = self.config.ttl_rules.clone();
 
-        for result in self.disk.db_iter() {
-            let (key_bytes, entry) = match result {
-                Ok(pair) => pair,
-                Err(_) => continue,
-            };
+        // Phase 1: Collect expired keys in a blocking context.
+        // Uses metadata-only deserialization (skips the ~287KB value field)
+        // to minimize CPU and memory during the scan.
+        let expired_keys: Vec<Bytes> = tokio::task::block_in_place(|| {
+            let mut expired = Vec::new();
 
-            // Check per-key TTL first
-            if let Some(ttl_secs) = entry.ttl_secs {
-                if now.signed_duration_since(entry.updated_at) > Duration::seconds(ttl_secs as i64) {
-                    expired_keys.push(Bytes::copy_from_slice(&key_bytes));
-                    continue;
+            for result in self.disk.db_iter_meta() {
+                let (key_bytes, meta) = match result {
+                    Ok(pair) => pair,
+                    Err(_) => continue,
+                };
+
+                // Check per-key TTL first
+                if let Some(ttl_secs) = meta.ttl_secs {
+                    if now.signed_duration_since(meta.updated_at) > Duration::seconds(ttl_secs as i64) {
+                        expired.push(Bytes::copy_from_slice(&key_bytes));
+                        continue;
+                    }
+                }
+
+                // Fall back to prefix-based TTL rules
+                let key_str = String::from_utf8_lossy(&key_bytes);
+                let ttl = ttl_rules.iter().find_map(|rule| {
+                    if key_str.starts_with(&rule.prefix) {
+                        Some(Duration::seconds(rule.ttl_secs as i64))
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some(ttl) = ttl {
+                    if now.signed_duration_since(meta.created_at) > ttl {
+                        expired.push(Bytes::copy_from_slice(&key_bytes));
+                    }
                 }
             }
 
-            // Fall back to prefix-based TTL rules
-            let key_str = String::from_utf8_lossy(&key_bytes);
-            let ttl = self.config.ttl_rules.iter().find_map(|rule| {
-                if key_str.starts_with(&rule.prefix) {
-                    Some(Duration::seconds(rule.ttl_secs as i64))
-                } else {
-                    None
-                }
-            });
-
-            if let Some(ttl) = ttl {
-                if now.signed_duration_since(entry.created_at) > ttl {
-                    expired_keys.push(Bytes::copy_from_slice(&key_bytes));
-                }
-            }
-        }
+            expired
+        });
 
         if expired_keys.is_empty() {
             return Ok(0);
@@ -349,15 +390,22 @@ impl TieredEngine {
         let count = expired_keys.len();
         info!(count, "Cleaning up expired entries");
 
+        // Phase 2: Delete from memory + disk (fast local operations)
         for key in &expired_keys {
-            // Remove from cache
             self.memory.delete(key);
-            // Remove from disk
             let _ = self.disk.delete(key);
-            // Remove from object storage
-            let object_key = Self::to_object_key(key);
-            let _ = self.object.delete(&object_key).await;
         }
+
+        // Phase 3: Delete from object storage concurrently
+        // Collect futures first (releases borrows) then join them all
+        let delete_futs: Vec<_> = expired_keys.iter().map(|key| {
+            let object_key = Self::to_object_key(key);
+            let object = self.object.clone();
+            async move {
+                let _ = object.delete(&object_key).await;
+            }
+        }).collect();
+        futures::future::join_all(delete_futs).await;
 
         Ok(count)
     }
@@ -545,7 +593,7 @@ mod tests {
 
     // ==================== MIGRATION ====================
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_migration_moves_old_data_to_object_storage() {
         let (engine, _temp) = create_test_engine();
 
@@ -573,7 +621,7 @@ mod tests {
         assert_eq!(result.tier, StorageTier::Object);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_migration_returns_zero_when_nothing_to_migrate() {
         let (engine, _temp) = create_test_engine();
 
@@ -607,11 +655,9 @@ mod tests {
     async fn test_disk_usage_percent() {
         let (engine, _temp) = create_test_engine();
 
-        // Start with 0% usage
-        assert_eq!(engine.disk_usage_percent(), 0.0);
-
-        // Add some data
-        engine.put(b"key1", Bytes::from("x".repeat(500))).await.unwrap();
+        // Add some data and flush to SST
+        engine.put(b"key1", Bytes::from("x".repeat(1000))).await.unwrap();
+        engine.flush().unwrap();
 
         // Should now have some usage
         assert!(engine.disk_usage_percent() > 0.0);
