@@ -65,6 +65,8 @@ pub struct EngineConfig {
     pub migration_batch_size: usize,
     /// Disk usage threshold (%) that triggers migration
     pub migration_threshold_percent: f64,
+    /// Cache-only mode: disable migration to object storage
+    pub cache_only: bool,
     /// TTL rules by key prefix. Keys not matching any rule live forever.
     pub ttl_rules: Vec<TtlRule>,
 }
@@ -77,6 +79,7 @@ impl Default for EngineConfig {
             object: ObjectConfig::default(),
             migration_batch_size: 100,
             migration_threshold_percent: 80.0,
+            cache_only: false,
             ttl_rules: vec![],
         }
     }
@@ -439,7 +442,7 @@ impl TieredEngine {
 
     /// Check if migration should run
     pub fn should_migrate(&self) -> bool {
-        self.disk_usage_percent() >= self.config.migration_threshold_percent
+        !self.config.cache_only && self.disk_usage_percent() >= self.config.migration_threshold_percent
     }
 
     /// Flush disk to ensure durability
@@ -488,6 +491,7 @@ mod tests {
             object: ObjectConfig::default(),
             migration_batch_size: 10,
             migration_threshold_percent: 80.0,
+            cache_only: false,
             ttl_rules: vec![],
         };
 

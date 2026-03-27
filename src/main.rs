@@ -92,6 +92,7 @@ async fn main() {
         },
         migration_batch_size: get_env_or("MIGRATION_BATCH_SIZE", 100),
         migration_threshold_percent: get_env_or("MIGRATION_THRESHOLD_PERCENT", 80.0),
+        cache_only: get_env_or("CACHE_ONLY", false),
         ttl_rules: parse_ttl_rules(&env::var("TTL_RULES").unwrap_or_default()),
     };
 
@@ -106,6 +107,9 @@ async fn main() {
         config.disk.migration_age_secs / 3600);
     info!("  Object Storage: bucket={}, region={}",
         config.object.bucket, config.object.region);
+    if config.cache_only {
+        info!("  Cache-only mode: migration to object storage DISABLED");
+    }
     if !config.ttl_rules.is_empty() {
         for rule in &config.ttl_rules {
             info!("  TTL: prefix='{}' -> {}s", rule.prefix, rule.ttl_secs);

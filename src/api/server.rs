@@ -3,6 +3,7 @@
 //! Creates the Axum router with all API routes.
 
 use axum::{
+    extract::DefaultBodyLimit,
     routing::{delete, get, head, post, put},
     Router,
 };
@@ -57,6 +58,7 @@ pub fn create_router(state: AppState) -> Router {
         // Debug/profiling
         .route("/debug/profile", get(handlers::cpu_profile))
         // Middleware
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024)) // 64MB
         .layer(TraceLayer::new_for_http())
         // State
         .with_state(state)

@@ -49,6 +49,7 @@ struct RingPoint {
 }
 
 /// Routes keys to shards using consistent hashing
+#[derive(Clone)]
 pub struct ShardRouter {
     config: ShardConfig,
     /// The consistent hash ring (sorted by hash value)

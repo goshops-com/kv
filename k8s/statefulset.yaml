@@ -5,9 +5,7 @@ metadata:
   labels:
     app: tieredkv
 spec:
-  serviceName: tieredkv-headless
-  # Number of shards - each pod is one shard
-  # Increase this to add more shards
+  serviceName: tieredkv
   replicas: 3
   podManagementPolicy: Parallel
   selector:
@@ -19,10 +17,12 @@ spec:
         app: tieredkv
     spec:
       terminationGracePeriodSeconds: 30
+      imagePullSecrets:
+        - name: regcred
       containers:
         - name: tieredkv
-          image: tieredkv:latest
-          imagePullPolicy: IfNotPresent
+          image: goshops/kv:latest
+          imagePullPolicy: Always
           ports:
             - name: http
               containerPort: 8080
@@ -30,37 +30,26 @@ spec:
           envFrom:
             - configMapRef:
                 name: tieredkv-config
+            - secretRef:
+                name: tieredkv-azure-credentials
           env:
-            # Shard ID is derived from pod ordinal index
             - name: POD_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            - name: SHARD_ID
-              value: "$(POD_NAME)"
-            # Total shards must match replicas count
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
             - name: TOTAL_SHARDS
               value: "3"
-            # S3 credentials from secret
-            - name: AWS_ACCESS_KEY_ID
-              valueFrom:
-                secretKeyRef:
-                  name: tieredkv-s3-credentials
-                  key: access-key-id
-                  optional: true
-            - name: AWS_SECRET_ACCESS_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: tieredkv-s3-credentials
-                  key: secret-access-key
-                  optional: true
           resources:
             requests:
-              memory: "512Mi"
-              cpu: "250m"
-            limits:
               memory: "2Gi"
-              cpu: "2000m"
+              cpu: "100m"
+            limits:
+              memory: "8Gi"
+              cpu: "3000m"
           volumeMounts:
             - name: data
               mountPath: /data
@@ -88,6 +77,4 @@ spec:
           - ReadWriteOnce
         resources:
           requests:
-            storage: 100Gi
-        # Use your cluster's storage class
-        # storageClassName: standard
+            storage: 50Gi

@@ -1,5 +1,5 @@
 # Build stage
-FROM rust:1.75-slim-bookworm AS builder
+FROM rust:1.85-slim-bookworm AS builder
 
 WORKDIR /app
 
@@ -7,6 +7,8 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
+    clang \
+    libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy manifests
@@ -16,7 +18,7 @@ COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && \
     echo "fn main() {}" > src/main.rs && \
     echo "pub fn dummy() {}" > src/lib.rs && \
-    cargo build --release && \
+    cargo build --release --features azure,cluster && \
     rm -rf src
 
 # Copy source code
@@ -24,7 +26,7 @@ COPY src ./src
 
 # Build the actual application
 RUN touch src/main.rs src/lib.rs && \
-    cargo build --release
+    cargo build --release --features azure,cluster
 
 # Runtime stage
 FROM debian:bookworm-slim

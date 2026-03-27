@@ -27,7 +27,7 @@ pub enum ObjectError {
 /// Configuration for object storage
 #[derive(Debug, Clone)]
 pub struct ObjectConfig {
-    /// S3 bucket name
+    /// S3 bucket or Azure container name
     pub bucket: String,
     /// S3 endpoint (for MinIO or custom S3-compatible storage)
     pub endpoint: Option<String>,
@@ -35,6 +35,10 @@ pub struct ObjectConfig {
     pub region: String,
     /// Prefix for all keys
     pub prefix: String,
+    /// Azure storage account name (when using Azure backend)
+    pub azure_account: Option<String>,
+    /// Azure storage access key (when using Azure backend)
+    pub azure_access_key: Option<String>,
 }
 
 impl Default for ObjectConfig {
@@ -44,6 +48,8 @@ impl Default for ObjectConfig {
             endpoint: None,
             region: "us-east-1".to_string(),
             prefix: "data/".to_string(),
+            azure_account: None,
+            azure_access_key: None,
         }
     }
 }
@@ -286,6 +292,8 @@ mod tests {
             endpoint: None,
             region: "us-east-1".to_string(),
             prefix: "test/".to_string(),
+            azure_account: None,
+            azure_access_key: None,
         })
     }
 
