@@ -195,20 +195,32 @@ pub struct DiskStore {
     entry_count: AtomicUsize,
 }
 
+fn env_mb(name: &str, default_mb: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default_mb)
+        * 1024
+        * 1024
+}
+
 fn make_opts() -> Options {
     let mut opts = Options::default();
     opts.create_if_missing(true);
     opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
-    // Block cache: 256MB — controls RSS for reads
-    let cache = rocksdb::Cache::new_lru_cache(256 * 1024 * 1024);
+    let block_cache_bytes = env_mb("ROCKSDB_BLOCK_CACHE_MB", 256);
+    let cache = rocksdb::Cache::new_lru_cache(block_cache_bytes);
     let mut block_opts = rocksdb::BlockBasedOptions::default();
     block_opts.set_block_cache(&cache);
     block_opts.set_block_size(16 * 1024);
     opts.set_block_based_table_factory(&block_opts);
 
-    // Larger write buffers = fewer L0 flushes = fewer compactions
-    opts.set_write_buffer_size(64 * 1024 * 1024); // 64MB (was 32MB)
-    opts.set_max_write_buffer_number(3);
+    opts.set_write_buffer_size(env_mb("ROCKSDB_WRITE_BUFFER_MB", 64));
+    let max_wb = std::env::var("ROCKSDB_MAX_WRITE_BUFFERS")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(3);
+    opts.set_max_write_buffer_number(max_wb);
 
     // L0 compaction triggers: tolerate more L0 files before compacting
     opts.set_level_zero_file_num_compaction_trigger(8);  // default 4
@@ -231,8 +243,7 @@ fn make_opts() -> Options {
     opts.set_enable_blob_gc(true); // garbage collect old blobs
     opts.set_blob_gc_age_cutoff(0.25); // GC blobs when 25% is garbage
 
-    // Limit total WAL size
-    opts.set_max_total_wal_size(128 * 1024 * 1024);
+    opts.set_max_total_wal_size(env_mb("ROCKSDB_MAX_WAL_MB", 128) as u64);
     // Limit LOG file accumulation
     opts.set_keep_log_file_num(5);
     opts.set_max_log_file_size(10 * 1024 * 1024);
