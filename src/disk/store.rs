@@ -222,6 +222,10 @@ fn make_opts() -> Options {
         .unwrap_or(3);
     opts.set_max_write_buffer_number(max_wb);
 
+    // Hard-cap total memory across all write buffers + memtables.
+    // Without this, write bursts grow memtables unbounded until cgroup OOM.
+    opts.set_db_write_buffer_size(env_mb("ROCKSDB_DB_WRITE_BUFFER_MB", 256));
+
     // L0 compaction triggers: tolerate more L0 files before compacting
     opts.set_level_zero_file_num_compaction_trigger(8);  // default 4
     opts.set_level_zero_slowdown_writes_trigger(20);     // default 20
