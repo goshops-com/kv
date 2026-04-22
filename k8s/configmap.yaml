@@ -6,7 +6,9 @@ metadata:
     app: tieredkv
 data:
   # Memory cache settings
-  MEMORY_MAX_SIZE_MB: "2048"
+  # Lowered 2048→1024 (2026-04-22) per observation that most of RSS is kernel page cache,
+  # not the L1 LRU. Halves the app-controlled heap budget, small latency trade-off on L1 misses.
+  MEMORY_MAX_SIZE_MB: "1024"
   MEMORY_MAX_ENTRIES: "500000"
 
   # RocksDB tuning (exposed as env vars in 2026-04-21 patch)
