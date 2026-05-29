@@ -234,8 +234,18 @@ fn make_opts() -> Options {
     // Larger L1 target = less write amplification across levels
     opts.set_max_bytes_for_level_base(512 * 1024 * 1024); // 512MB (default 256MB)
 
-    // Limit compaction concurrency to reduce CPU spikes
-    opts.set_max_background_jobs(2);
+    // Compaction/flush concurrency. Hardcoded 2 starved compaction under sustained
+    // writes: L0 files piled up faster than 2 threads could compact, hitting the
+    // L0 slowdown(20)/stop(36) triggers → multi-second write stalls (PUTs returning
+    // "context deadline exceeded" under burst). Make it tunable via env. Default
+    // stays 2 so existing deployments are unchanged; raise per-deployment in the
+    // configmap (search-kv sets 6) where the write load needs it.
+    let max_bg_jobs = std::env::var("ROCKSDB_MAX_BACKGROUND_JOBS")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(2);
+    opts.set_max_background_jobs(max_bg_jobs);
 
     // BlobDB: separate large values (>4KB) into blob files.
     // Only small key pointers stay in the LSM tree, drastically
