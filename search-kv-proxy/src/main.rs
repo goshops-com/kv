@@ -148,11 +148,7 @@ async fn main() {
         .init();
 
     let router = Arc::new(build_router());
-    info!(
-        "search-kv-proxy: {} shard(s), {} virtual nodes",
-        router.total_shards(),
-        router.all_shards().len()
-    );
+    info!("search-kv-proxy: routing across {} shard(s)", router.total_shards());
     for s in router.all_shards() {
         info!("  shard[{}] -> {}", s.shard_id, s.address);
     }
