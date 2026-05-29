@@ -102,8 +102,10 @@ pub async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
     })
 }
 
-/// Strip leading slash from wildcard path capture
-fn normalize_key(key: String) -> String {
+/// Strip leading slash from wildcard path capture.
+/// Public so the standalone router (search-kv-proxy) normalizes keys identically
+/// before hashing — same code, no parity drift between proxy and shards.
+pub fn normalize_key(key: String) -> String {
     key.strip_prefix('/').map(String::from).unwrap_or(key)
 }
 

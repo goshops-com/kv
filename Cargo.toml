@@ -3,6 +3,19 @@ name = "tieredkv"
 version = "0.1.0"
 edition = "2021"
 description = "A tiered key-value store with memory, disk, and object storage layers"
+autobins = false
+
+# Main key-value store server.
+[[bin]]
+name = "tieredkv"
+path = "src/main.rs"
+
+# Stateless consistent-hash router in front of sharded search-kv instances.
+# Needs the `cluster` feature (pulls reqwest) — build with `--features cluster`.
+[[bin]]
+name = "search-kv-proxy"
+path = "src/bin/search_kv_proxy.rs"
+required-features = ["cluster"]
 
 [dependencies]
 # Async runtime

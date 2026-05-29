@@ -3,6 +3,7 @@ mod server;
 
 pub use handlers::{
     GetResponse, PutRequest, DeleteResponse, HealthResponse, StatsResponse, ErrorResponse,
+    normalize_key,
 };
 pub use server::{create_router, AppState};
 #[cfg(feature = "cluster")]

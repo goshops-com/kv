@@ -1,0 +1,48 @@
+# search-kv-proxy: stateless consistent-hash router in front of sharded search-kv.
+# Builds the `search-kv-proxy` binary from the same crate as the kv, so the ring
+# (xxh3_64 + virtual nodes) and key normalization are the exact same code.
+
+# Build stage
+FROM rust:1.85-slim-bookworm AS builder
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    clang \
+    libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY Cargo.toml Cargo.lock ./
+
+# Cache dependencies: dummy sources for the lib and every declared bin target.
+RUN mkdir -p src/bin && \
+    echo "fn main() {}" > src/main.rs && \
+    echo "pub fn dummy() {}" > src/lib.rs && \
+    echo "fn main() {}" > src/bin/search_kv_proxy.rs && \
+    cargo build --release --features cluster --bin search-kv-proxy && \
+    rm -rf src
+
+COPY src ./src
+
+RUN touch src/lib.rs src/bin/search_kv_proxy.rs && \
+    cargo build --release --features cluster --bin search-kv-proxy
+
+# Runtime stage
+FROM debian:bookworm-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/search-kv-proxy /usr/local/bin/
+
+ENV RUST_LOG=info
+ENV HTTP_PORT=8080
+
+EXPOSE 8080
+
+CMD ["search-kv-proxy"]
