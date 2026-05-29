@@ -11,22 +11,29 @@ RUN apt-get update && apt-get install -y \
     libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy manifests
+# Copy workspace + member manifests
 COPY Cargo.toml Cargo.lock ./
+COPY shard-router/Cargo.toml ./shard-router/Cargo.toml
+COPY search-kv-proxy/Cargo.toml ./search-kv-proxy/Cargo.toml
 
-# Create a dummy main to cache dependencies
-RUN mkdir src && \
+# Create dummy sources for every workspace member to cache dependencies.
+# `cargo build` here builds only the tieredkv package (+ shard-router dep); the
+# search-kv-proxy member just needs to exist for the workspace to load.
+RUN mkdir -p src shard-router/src search-kv-proxy/src && \
     echo "fn main() {}" > src/main.rs && \
     echo "pub fn dummy() {}" > src/lib.rs && \
+    echo "" > shard-router/src/lib.rs && \
+    echo "fn main() {}" > search-kv-proxy/src/main.rs && \
     cargo build --release --features azure,cluster && \
-    rm -rf src
+    rm -rf src shard-router/src search-kv-proxy/src
 
-# Copy source code
+# Copy real source code (all workspace members)
 COPY src ./src
+COPY shard-router ./shard-router
+COPY search-kv-proxy ./search-kv-proxy
 
-# Build the actual application
-RUN touch src/main.rs src/lib.rs && \
-    cargo build --release --features azure,cluster
+# Build the actual application (tieredkv only)
+RUN cargo build --release --features azure,cluster
 
 # Runtime stage
 FROM debian:bookworm-slim

@@ -1,0 +1,20 @@
+[package]
+name = "search-kv-proxy"
+version = "0.1.0"
+edition = "2021"
+description = "Stateless consistent-hash router in front of sharded search-kv. Reuses shard-router (no rocksdb/engine)."
+
+[[bin]]
+name = "search-kv-proxy"
+path = "src/main.rs"
+
+[dependencies]
+# The ONLY routing dependency — same ring code the shards use.
+shard-router = { path = "../shard-router" }
+
+tokio = { version = "1.35", features = ["rt-multi-thread", "net", "macros"] }
+axum = "0.7"
+# Plain-HTTP client to forward to shards; no TLS needed inside the cluster.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

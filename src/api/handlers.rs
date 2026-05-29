@@ -102,12 +102,9 @@ pub async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
     })
 }
 
-/// Strip leading slash from wildcard path capture.
-/// Public so the standalone router (search-kv-proxy) normalizes keys identically
-/// before hashing — same code, no parity drift between proxy and shards.
-pub fn normalize_key(key: String) -> String {
-    key.strip_prefix('/').map(String::from).unwrap_or(key)
-}
+// normalize_key lives in the shared shard-router crate (re-exported via crate::cluster)
+// so the proxy and the shards normalize identically.
+use crate::cluster::normalize_key;
 
 /// GET /kv/*key - Get a value by key
 pub async fn get_key(

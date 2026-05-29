@@ -1,0 +1,8 @@
+[package]
+name = "shard-router"
+version = "0.1.0"
+edition = "2021"
+description = "Consistent-hash ring shared by tieredkv shards and search-kv-proxy (single source of truth for routing)"
+
+[dependencies]
+xxhash-rust = { version = "0.8", features = ["xxh3"] }

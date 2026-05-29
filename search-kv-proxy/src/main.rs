@@ -7,15 +7,13 @@
 //! xxh3_64 consistent-hash ring in every client language (Python search-inference,
 //! Go model-local-proxy, Node feature-store). That cross-language parity is exactly
 //! what caused silent data loss in the feature-store before. Instead, this proxy
-//! reuses `tieredkv`'s own `ShardRouter` and `normalize_key` VERBATIM, so routing is
-//! byte-identical to what each shard's `owns_key()` expects. Clients keep talking to
-//! a single endpoint and never learn the ring.
+//! depends on the SAME `shard-router` crate the kv uses, so its routing is
+//! byte-identical to what each shard's `owns_key()` expects. It pulls only the ring
+//! (xxhash) — no rocksdb/engine — so it builds in seconds and ships a tiny image.
 //!
 //! Stateless → run several replicas behind a Service. The only state is the ring,
-//! derived deterministically from env (TOTAL_SHARDS + DNS template), so every replica
-//! routes identically.
-//!
-//! Build: `cargo build --release --features cluster --bin search-kv-proxy`
+//! derived deterministically from env (TOTAL_SHARDS + DNS template), so every
+//! replica routes identically.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,8 +26,7 @@ use axum::{
     routing::{any, get},
     Router,
 };
-use tieredkv::api::normalize_key;
-use tieredkv::cluster::{ShardAddress, ShardConfig, ShardRouter};
+use shard_router::{normalize_key, ShardAddress, ShardConfig, ShardRouter};
 use tracing::{error, info};
 
 #[derive(Clone)]
@@ -49,8 +46,9 @@ fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> T {
 /// Build the ring from env.
 ///
 /// Shard addresses come from either an explicit `SHARD_ADDRESSES` list (comma
-/// separated `host:port`, indexed as shard 0..N — handy for local testing and ops
-/// overrides) or, by default, the StatefulSet headless-service DNS convention:
+/// separated `host:port`, indexed as shard 0..N — handy for local testing, ops
+/// overrides, and the single-shard passthrough cutover) or, by default, the
+/// StatefulSet headless-service DNS convention:
 /// `{service}-{id}.{service}.{namespace}.svc.cluster.local:{port}`.
 fn build_router() -> ShardRouter {
     let virtual_nodes: u32 = env_parse("VIRTUAL_NODES", 150);
@@ -65,7 +63,7 @@ fn build_router() -> ShardRouter {
             .collect(),
         _ => {
             let total_shards: u32 = env_parse("TOTAL_SHARDS", 1);
-            let service = env_or("SHARD_SERVICE_NAME", "search-kv-shard");
+            let service = env_or("SHARD_SERVICE_NAME", "search-kv");
             let namespace = env_or("POD_NAMESPACE", "default");
             let port = env_or("SHARD_PORT", "8080");
             (0..total_shards)
@@ -79,8 +77,6 @@ fn build_router() -> ShardRouter {
         }
     };
 
-    // total_shards must equal the number of addresses for the ring to be built
-    // consistently with the shards (whose VIRTUAL_NODES/TOTAL_SHARDS must match).
     let total_shards = shard_addresses.len() as u32;
 
     // shard_id is irrelevant for the router (it owns nothing, it only routes).
@@ -161,8 +157,6 @@ async fn main() {
         info!("  shard[{}] -> {}", s.shard_id, s.address);
     }
 
-    // One pooled HTTP client. Timeout is the upstream-shard ceiling; clients already
-    // apply their own short cache-GET timeout, so keep this modest.
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(env_parse("SHARD_TIMEOUT_SECS", 5)))
         .pool_max_idle_per_host(env_parse("POOL_MAX_IDLE_PER_HOST", 64))

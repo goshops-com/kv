@@ -7,6 +7,13 @@
 use std::collections::BTreeMap;
 use xxhash_rust::xxh3::xxh3_64;
 
+/// Strip the leading `/` that an axum `/kv/*key` catch-all captures, so the hashed
+/// key is identical whether it's hashed by a shard (to check ownership) or by the
+/// router (to pick the shard). Single definition shared by both — no parity drift.
+pub fn normalize_key(key: String) -> String {
+    key.strip_prefix('/').map(String::from).unwrap_or(key)
+}
+
 /// Configuration for sharding
 #[derive(Debug, Clone)]
 pub struct ShardConfig {

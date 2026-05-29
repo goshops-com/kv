@@ -1,33 +1,21 @@
 # search-kv-proxy: stateless consistent-hash router in front of sharded search-kv.
-# Builds the `search-kv-proxy` binary from the same crate as the kv, so the ring
-# (xxh3_64 + virtual nodes) and key normalization are the exact same code.
+# Builds ONLY the proxy crate, whose dep tree is shard-router (xxhash) + axum +
+# reqwest(no-TLS) + tokio — NO rocksdb/engine, so no clang and a fast, tiny build.
 
 # Build stage
 FROM rust:1.85-slim-bookworm AS builder
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y \
-    pkg-config \
-    libssl-dev \
-    clang \
-    libclang-dev \
-    && rm -rf /var/lib/apt/lists/*
-
+# Workspace manifests + all member sources (cheap). `cargo build -p search-kv-proxy`
+# only compiles the proxy + shard-router; the tieredkv package and its heavy deps
+# (rocksdb, object_store) are resolved but never compiled.
 COPY Cargo.toml Cargo.lock ./
-
-# Cache dependencies: dummy sources for the lib and every declared bin target.
-RUN mkdir -p src/bin && \
-    echo "fn main() {}" > src/main.rs && \
-    echo "pub fn dummy() {}" > src/lib.rs && \
-    echo "fn main() {}" > src/bin/search_kv_proxy.rs && \
-    cargo build --release --features cluster --bin search-kv-proxy && \
-    rm -rf src
-
+COPY shard-router ./shard-router
+COPY search-kv-proxy ./search-kv-proxy
 COPY src ./src
 
-RUN touch src/lib.rs src/bin/search_kv_proxy.rs && \
-    cargo build --release --features cluster --bin search-kv-proxy
+RUN cargo build --release -p search-kv-proxy
 
 # Runtime stage
 FROM debian:bookworm-slim
