@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use axum::{
     body::{Body, Bytes},
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{header::CONTENT_TYPE, HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{any, get},
@@ -161,9 +161,17 @@ async fn main() {
 
     let state = ProxyState { router, client };
 
+    // Match the shards' DefaultBodyLimit (64MB in src/api/server.rs). axum's
+    // `Bytes` extractor (used by proxy_kv) otherwise caps request bodies at the
+    // built-in 2MB default, so large PUTs (e.g. the full search-result set stored
+    // for pagination under search-pagination:*) get rejected here with 413 and
+    // never reach the shard — silently breaking pagination for big result sets.
+    let max_body_bytes: usize = env_parse("MAX_BODY_BYTES", 64 * 1024 * 1024);
+
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/kv/*key", any(proxy_kv))
+        .layer(DefaultBodyLimit::max(max_body_bytes))
         .with_state(state);
 
     let port = env_or("HTTP_PORT", "8080");
