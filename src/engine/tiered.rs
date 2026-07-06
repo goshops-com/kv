@@ -36,6 +36,26 @@ fn decompress_if_needed(data: &Bytes) -> Result<Bytes, EngineError> {
     }
 }
 
+/// Decompress off the async runtime. A flood of gets doing inline zstd
+/// (`decompress_if_needed`) was CPU-starving the tokio worker threads, so even the
+/// trivial static `/health` task couldn't be scheduled — the liveness probe then
+/// killed the pod (2026-07-06 search-kv flapping). `spawn_blocking` moves the
+/// CPU-bound work to the blocking pool, keeping the async runtime responsive.
+async fn decompress_async(data: Bytes) -> Result<Bytes, EngineError> {
+    tokio::task::spawn_blocking(move || decompress_if_needed(&data))
+        .await
+        .map_err(|e| EngineError::Disk(DiskError::Serialization(format!("decompress join error: {e}"))))?
+}
+
+/// Compress off the async runtime (same reason as `decompress_async`). Values can
+/// be large (287KB JSON → ~30KB), so inline zstd compression on writes — e.g. the
+/// cache-repopulation write flood after a cold restart — starved the runtime too.
+async fn compress_async(data: Bytes) -> Result<Bytes, EngineError> {
+    tokio::task::spawn_blocking(move || compress_value(&data))
+        .await
+        .map_err(|e| EngineError::Disk(DiskError::Serialization(format!("compress join error: {e}"))))?
+}
+
 #[derive(Error, Debug)]
 pub enum EngineError {
     #[error("Disk error: {0}")]
@@ -159,7 +179,7 @@ impl TieredEngine {
         // L1: Check memory cache (stores compressed values)
         if let Some(cached) = self.memory.get(key) {
             debug!(key = %key_str, "Cache hit");
-            let value = decompress_if_needed(&cached)?;
+            let value = decompress_async(cached).await?;
             return Ok(Some(EntryInfo {
                 value,
                 created_at: Utc::now(), // Approximate
@@ -172,7 +192,7 @@ impl TieredEngine {
             debug!(key = %key_str, "Disk hit, promoting to cache");
             // Promote raw (possibly compressed) value to cache
             self.memory.put(key, entry.value.clone());
-            let value = decompress_if_needed(&entry.value)?;
+            let value = decompress_async(entry.value).await?;
             return Ok(Some(EntryInfo {
                 value,
                 created_at: entry.created_at,
@@ -188,7 +208,7 @@ impl TieredEngine {
                 let value = entry.value.clone();
                 // Promote to cache (not disk, as it was migrated from disk)
                 self.memory.put(key, value.clone());
-                let value = decompress_if_needed(&value)?;
+                let value = decompress_async(value).await?;
                 Ok(Some(EntryInfo {
                     value,
                     created_at: entry.metadata.created_at,
@@ -215,8 +235,9 @@ impl TieredEngine {
         let key_str = String::from_utf8_lossy(key);
         debug!(key = %key_str, size = value.len(), "Putting key");
 
-        // Compress value before storing (JSON 287KB → ~30KB with zstd)
-        let compressed = compress_value(&value)?;
+        // Compress value before storing (JSON 287KB → ~30KB with zstd), off the
+        // async runtime so a write flood can't CPU-starve it (see compress_async).
+        let compressed = compress_async(value).await?;
 
         // Write compressed to disk (durability)
         self.disk.put_with_ttl(key, compressed.clone(), ttl_secs)?;
@@ -416,6 +437,45 @@ impl TieredEngine {
     /// Re-serialize legacy JSON entries to MessagePack format
     pub fn reserialize_legacy_batch(&self, batch_size: usize) -> Result<usize, EngineError> {
         Ok(self.disk.reserialize_legacy_batch(batch_size)?)
+    }
+
+    /// Delete keys this shard no longer owns — orphans left behind by a resharding
+    /// event. When the ring changed (e.g. 1 shard -> 2), keys written under the old
+    /// ring stay physically here but are never read again, because the proxy now
+    /// routes them to their new owner. They are pure dead weight on disk (and in
+    /// RocksDB index/filter RAM). `owns(key)` must use the SAME consistent-hash ring
+    /// as the proxy, so we only ever drop keys the proxy would never send here.
+    /// `dry_run` counts without deleting. Deletes are batched with a yield between
+    /// batches so a large sweep neither starves serving nor floods RocksDB with
+    /// tombstones at once. Returns (scanned, unowned, deleted).
+    pub async fn scrub_unowned<F: Fn(&[u8]) -> bool>(
+        &self,
+        owns: F,
+        dry_run: bool,
+    ) -> Result<(u64, u64, u64), EngineError> {
+        // Snapshot the non-owned keys first; don't mutate the DB mid-iteration.
+        let mut unowned: Vec<Bytes> = Vec::new();
+        let mut scanned: u64 = 0;
+        for key in self.disk.keys() {
+            scanned += 1;
+            if !owns(&key) {
+                unowned.push(key);
+            }
+        }
+        let unowned_count = unowned.len() as u64;
+        if dry_run {
+            return Ok((scanned, unowned_count, 0));
+        }
+        let mut deleted: u64 = 0;
+        for batch in unowned.chunks(500) {
+            for key in batch {
+                if self.delete(key).await? {
+                    deleted += 1;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+        Ok((scanned, unowned_count, deleted))
     }
 
     /// Get engine statistics
