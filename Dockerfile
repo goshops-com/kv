@@ -32,8 +32,14 @@ COPY src ./src
 COPY shard-router ./shard-router
 COPY search-kv-proxy ./search-kv-proxy
 
-# Build the actual application (tieredkv only)
-RUN cargo build --release --features azure,cluster
+# Build the actual application (tieredkv only).
+# The dummy-source dep-cache step above leaves cargo build fingerprints whose
+# mtimes can shadow these freshly COPYed sources (notably under buildx/QEMU, where
+# COPY mtimes lagged the cached dummy artifact). cargo then skips recompiling and
+# the dummy `fn main(){}` binary ships — a silent exit-0 crash loop at runtime.
+# Bump the workspace source mtimes so cargo always rebuilds the real code.
+RUN find src shard-router search-kv-proxy -name '*.rs' -exec touch {} + && \
+    cargo build --release --features azure,cluster
 
 # Runtime stage
 FROM debian:bookworm-slim

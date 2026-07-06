@@ -165,6 +165,16 @@ async fn main() {
     // Runs once at startup, converting 500 entries per batch with 1s pause between batches
     let reser_engine = engine.clone();
     tokio::spawn(async move {
+        // One-time legacy->MessagePack migration. It full-scans the WHOLE DB on every
+        // startup; on a large shard that scan saturates CPU long enough to starve the
+        // (static) /health handler, so the liveness probe SIGKILLs the pod before the
+        // scan can finish — which restarts it and re-runs the scan from scratch, an
+        // infinite crash loop. It is a *completed* migration, so make it opt-out:
+        // shards that have nothing left to convert set RESERIALIZE_ON_STARTUP=false.
+        if !get_env_or("RESERIALIZE_ON_STARTUP", true) {
+            info!("Legacy re-serialization skipped (RESERIALIZE_ON_STARTUP=false)");
+            return;
+        }
         // Wait for startup to settle
         tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
         info!("Starting legacy JSON → MessagePack re-serialization...");
@@ -213,6 +223,78 @@ async fn main() {
             }
         }
     });
+
+    // Start background scrub of keys this shard no longer owns (resharding orphans).
+    // Self-contained: it builds its OWN consistent-hash ring from SCRUB_TOTAL_SHARDS
+    // + this pod's shard id, matching the proxy's ring (same crate, same VIRTUAL_NODES),
+    // and is independent of the serving path — which stays shard-agnostic, so live
+    // requests are never rejected. Dry-run unless SCRUB_DELETE=true, so enabling
+    // deletion is a deliberate, observable second step. Disabled unless
+    // SCRUB_TOTAL_SHARDS > 1, so it never runs in single-shard or mid-reshard configs.
+    #[cfg(feature = "cluster")]
+    {
+        let scrub_total: u32 = get_env_or("SCRUB_TOTAL_SHARDS", 0u32);
+        if scrub_total > 1 {
+            let scrub_shard_id: u32 = env::var("SHARD_ID")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or_else(|| {
+                    env::var("POD_NAME")
+                        .ok()
+                        .and_then(|name| name.rsplit('-').next().and_then(|s| s.parse().ok()))
+                })
+                .unwrap_or(0);
+            let scrub_vnodes: u32 = get_env_or("VIRTUAL_NODES", 150);
+            let scrub_addresses: Vec<ShardAddress> = (0..scrub_total)
+                .map(|id| ShardAddress { shard_id: id, address: String::new() })
+                .collect();
+            let scrub_router = ShardRouter::new(ShardConfig {
+                shard_id: scrub_shard_id,
+                total_shards: scrub_total,
+                virtual_nodes: scrub_vnodes,
+                shard_addresses: scrub_addresses,
+            });
+            let scrub_delete = env::var("SCRUB_DELETE")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false);
+            let scrub_interval = get_env_or("SCRUB_INTERVAL_SECS", 86_400u64);
+            let scrub_engine = engine.clone();
+            info!(
+                "Scrub task enabled: shard {}/{}, vnodes={}, interval={}s, mode={}",
+                scrub_shard_id,
+                scrub_total,
+                scrub_vnodes,
+                scrub_interval,
+                if scrub_delete { "DELETE" } else { "dry-run" }
+            );
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(tokio::time::Duration::from_secs(scrub_interval));
+                loop {
+                    interval.tick().await;
+                    match scrub_engine
+                        .scrub_unowned(|k| scrub_router.owns_key(k), !scrub_delete)
+                        .await
+                    {
+                        Ok((scanned, unowned, deleted)) => {
+                            info!(
+                                "Scrub sweep: scanned={} unowned={} deleted={} ({})",
+                                scanned,
+                                unowned,
+                                deleted,
+                                if scrub_delete {
+                                    "deleted"
+                                } else {
+                                    "dry-run, nothing deleted"
+                                }
+                            );
+                        }
+                        Err(e) => warn!("Scrub sweep failed: {}", e),
+                    }
+                }
+            });
+        }
+    }
 
     // Bind to address
     let addr = format!("0.0.0.0:{}", port);

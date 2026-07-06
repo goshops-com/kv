@@ -1,0 +1,12 @@
+# Build artifacts — the image compiles fresh in-container; never ship host target/
+target/
+**/target/
+# Local RocksDB data and backups
+data/
+**/data/
+# VCS + k8s manifests + docs are not part of the build context
+.git/
+.github/
+k8s/
+*.md
+.dockerignore

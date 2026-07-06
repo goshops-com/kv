@@ -213,7 +213,31 @@ fn make_opts() -> Options {
     let mut block_opts = rocksdb::BlockBasedOptions::default();
     block_opts.set_block_cache(&cache);
     block_opts.set_block_size(16 * 1024);
+
+    // Bound index/filter-block RAM. By default RocksDB keeps each SST's index and
+    // filter (bloom) blocks pinned in memory OUTSIDE the block cache, so anon grows
+    // with the on-disk dataset (SST count) — on a large shard this crossed the
+    // cgroup limit and OOM-killed the pod. Routing those blocks INTO the bounded
+    // LRU block cache (and pinning only L0's) caps total block memory at the cache
+    // size regardless of how big the disk grows. Opt-in so existing deployments are
+    // unchanged unless they set ROCKSDB_CACHE_INDEX_AND_FILTER=true.
+    let cache_index_and_filter = std::env::var("ROCKSDB_CACHE_INDEX_AND_FILTER")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    if cache_index_and_filter {
+        block_opts.set_cache_index_and_filter_blocks(true);
+        block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+    }
     opts.set_block_based_table_factory(&block_opts);
+
+    // Cap how many SST file readers stay open. -1 (default) keeps every file open,
+    // pinning its table metadata in RAM — unbounded as the dataset grows. A finite
+    // cap lets RocksDB evict cold readers (and their metadata) under the LRU above.
+    let max_open_files = std::env::var("ROCKSDB_MAX_OPEN_FILES")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(-1);
+    opts.set_max_open_files(max_open_files);
 
     opts.set_write_buffer_size(env_mb("ROCKSDB_WRITE_BUFFER_MB", 64));
     let max_wb = std::env::var("ROCKSDB_MAX_WRITE_BUFFERS")
