@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     clang \
     libclang-dev \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy workspace + member manifests
