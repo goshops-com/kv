@@ -3,6 +3,11 @@
 //! Run with: cargo run
 //! Or with custom config: RUST_LOG=debug DATA_DIR=/tmp/data cargo run
 
+// jemalloc as the global allocator — fixes the glibc RSS bloat / periodic OOM under
+// the 287KB-value churn (see Cargo.toml). Tune decay via _RJEM_MALLOC_CONF env.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::env;
 use std::sync::Arc;
 use tokio::net::TcpListener;

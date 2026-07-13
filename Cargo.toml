@@ -27,6 +27,12 @@ serde_json = "1.0"
 # Disk storage - RocksDB with zstd compression, controlled memory
 rocksdb = { version = "0.22", default-features = false, features = ["zstd"] }
 
+# Global allocator: jemalloc handles the multi-threaded, large-allocation (~287KB
+# value) churn far better than glibc malloc, which bloated RSS to the 8Gi cgroup
+# limit and OOM-killed the pod (glibc arenas retain freed memory). background_threads
+# proactively returns memory to the OS; profiling is available for heap analysis.
+tikv-jemallocator = { version = "0.6", features = ["background_threads", "profiling"] }
+
 # Object storage - unified S3/Azure/GCS client
 object_store = { version = "0.13", optional = true, features = ["azure"] }
 
