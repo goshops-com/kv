@@ -444,7 +444,13 @@ impl DiskStore {
 
     /// Iterate over all entries with metadata only (skips value deserialization)
     pub fn db_iter_meta(&self) -> impl Iterator<Item = Result<(Vec<u8>, StoredEntryMeta), DiskError>> + '_ {
-        self.db.iterator(rocksdb::IteratorMode::Start).map(|result| {
+        // TTL-cleanup full-keyspace scan: don't pollute the block cache with cold
+        // scan blocks (they'd evict hot request data and churn the LRU). The scan
+        // still reads each value to extract its metadata, but keeping fill_cache
+        // off avoids trashing the cache for live traffic on every sweep.
+        let mut ro = rocksdb::ReadOptions::default();
+        ro.fill_cache(false);
+        self.db.iterator_opt(rocksdb::IteratorMode::Start, ro).map(|result| {
             let (key, data) = result.map_err(DiskError::from)?;
             let meta = deserialize_entry_meta(&data)?;
             Ok((key.to_vec(), meta))
