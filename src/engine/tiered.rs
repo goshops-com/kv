@@ -187,8 +187,11 @@ impl TieredEngine {
             }));
         }
 
-        // L2: Check disk (values may be compressed or legacy uncompressed)
-        if let Some(entry) = self.disk.get(key)? {
+        // L2: Check disk (values may be compressed or legacy uncompressed).
+        // RocksDB get is blocking IO; run it off the async runtime so disk
+        // contention can't starve the worker threads (would hang /health →
+        // liveness kill loop; see the flapping notes on compress/decompress above).
+        if let Some(entry) = tokio::task::block_in_place(|| self.disk.get(key))? {
             debug!(key = %key_str, "Disk hit, promoting to cache");
             // Promote raw (possibly compressed) value to cache
             self.memory.put(key, entry.value.clone());
@@ -239,8 +242,9 @@ impl TieredEngine {
         // async runtime so a write flood can't CPU-starve it (see compress_async).
         let compressed = compress_async(value).await?;
 
-        // Write compressed to disk (durability)
-        self.disk.put_with_ttl(key, compressed.clone(), ttl_secs)?;
+        // Write compressed to disk (durability). Blocking RocksDB write off the
+        // async runtime (same reason as the get path).
+        tokio::task::block_in_place(|| self.disk.put_with_ttl(key, compressed.clone(), ttl_secs))?;
 
         // Cache compressed value (10x more entries fit in cache)
         let evicted = self.memory.put(key, compressed);
@@ -265,8 +269,8 @@ impl TieredEngine {
             deleted = true;
         }
 
-        // Remove from disk
-        if self.disk.delete(key)?.is_some() {
+        // Remove from disk (blocking RocksDB, off the async runtime)
+        if tokio::task::block_in_place(|| self.disk.delete(key))?.is_some() {
             deleted = true;
         }
 
@@ -287,8 +291,8 @@ impl TieredEngine {
             return Ok(true);
         }
 
-        // Check disk
-        if self.disk.contains(key)? {
+        // Check disk (blocking RocksDB, off the async runtime)
+        if tokio::task::block_in_place(|| self.disk.contains(key))? {
             return Ok(true);
         }
 
