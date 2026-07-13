@@ -17,7 +17,7 @@ tokio = { version = "1.35", features = ["full"] }
 
 # HTTP framework
 axum = { version = "0.7", features = ["macros"] }
-tower = { version = "0.4", features = ["util"] }
+tower = { version = "0.4", features = ["util", "limit"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 
 # Serialization

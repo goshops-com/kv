@@ -8,6 +8,7 @@ use axum::{
     Router,
 };
 use std::sync::Arc;
+use tower::limit::GlobalConcurrencyLimitLayer;
 use tower_http::trace::TraceLayer;
 
 use super::handlers;
@@ -43,6 +44,21 @@ impl ShardState {
 
 /// Create the API router with all routes
 pub fn create_router(state: AppState) -> Router {
+    // Bound in-flight request concurrency. Without this the write path buffers an
+    // unbounded number of raw ~287KB request bodies: a high-memory heap profile
+    // (2026-07-13, search-kv OOM cycle) showed 2.17GB / 91% of live heap sitting in
+    // `Json<PutRequest>` body deserialization. Under sustained load the compress →
+    // block_in_place(disk write) pipeline drains slower than intake (worse on iowait
+    // nodes), so raw values pile up until the 8Gi cgroup OOM-kills the pod. This layer
+    // is GLOBAL (one shared semaphore across all connections/clones): requests past the
+    // limit wait for a permit *before* the handler runs its body extractor, so nothing
+    // is buffered while queued. Tunable without a rebuild via MAX_CONCURRENT_REQUESTS.
+    let max_concurrent = std::env::var("MAX_CONCURRENT_REQUESTS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(512);
+
     Router::new()
         // Health and stats
         .route("/health", get(handlers::health))
@@ -57,8 +73,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/admin/flush", post(handlers::flush))
         // Debug/profiling
         .route("/debug/profile", get(handlers::cpu_profile))
-        // Middleware
-        .layer(DefaultBodyLimit::max(64 * 1024 * 1024)) // 64MB
+        // Middleware. Order matters: the concurrency limit sits OUTSIDE the body
+        // limit / handler so its permit is acquired before any body is read.
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024)) // 64MB per-request ceiling
+        .layer(GlobalConcurrencyLimitLayer::new(max_concurrent))
         .layer(TraceLayer::new_for_http())
         // State
         .with_state(state)
