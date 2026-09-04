@@ -204,6 +204,14 @@ fn env_mb(name: &str, default_mb: usize) -> usize {
         * 1024
 }
 
+fn env_f64(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0)
+        .unwrap_or(default)
+}
+
 fn make_opts() -> Options {
     let mut opts = Options::default();
     opts.create_if_missing(true);
@@ -278,8 +286,36 @@ fn make_opts() -> Options {
     opts.set_min_blob_size(4096); // values > 4KB go to blob files
     opts.set_blob_file_size(256 * 1024 * 1024); // 256MB blob files
     opts.set_blob_compression_type(rocksdb::DBCompressionType::Zstd);
-    opts.set_enable_blob_gc(true); // garbage collect old blobs
-    opts.set_blob_gc_age_cutoff(0.25); // GC blobs when 25% is garbage
+    opts.set_enable_blob_gc(true);
+
+    // age_cutoff does NOT mean "collect a file once 25% of it is garbage" -- it
+    // means "on every compaction, relocate the live blobs out of the oldest 25%
+    // of blob files", however little garbage those files actually hold. At 0.25
+    // (the RocksDB default) that rewrote essentially the whole value set every
+    // few hours. Measured on search-kv-1 over 54h of uptime: 55 GB ingested,
+    // 1078 GB of blob read and 1070 GB of blob written, 42h of compaction time,
+    // W-Amp 49 -- all to reclaim 0.4 GB of garbage out of 61 GB. The disk sat at
+    // roughly 2x the live data because obsolete blob files pile up between
+    // sweeps, and search-kv-1 hit 96% of a 100Gi volume on ~60 GB of real data.
+    //
+    // Relocate a much smaller slice per compaction, and use the knob that really
+    // is garbage-ratio based to collect files once they are mostly dead.
+    opts.set_blob_gc_age_cutoff(env_f64("ROCKSDB_BLOB_GC_AGE_CUTOFF", 0.05));
+    opts.set_blob_gc_force_threshold(env_f64("ROCKSDB_BLOB_GC_FORCE_THRESHOLD", 0.5));
+
+    // Obsolete files are unlinked at the end of each compaction, but files that
+    // fall out of scope by another path wait for a full directory sweep, which
+    // defaults to every 6 hours. That is what makes free space sawtooth by tens
+    // of GB. A scan over a few hundred files is cheap; do it far more often so
+    // disk usage tracks the live data instead of the last six hours of churn.
+    opts.set_delete_obsolete_files_period_micros(
+        std::env::var("ROCKSDB_DELETE_OBSOLETE_PERIOD_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(300)
+            * 1_000_000,
+    );
 
     opts.set_max_total_wal_size(env_mb("ROCKSDB_MAX_WAL_MB", 128) as u64);
     // Limit LOG file accumulation
