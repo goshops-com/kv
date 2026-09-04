@@ -116,7 +116,10 @@ mod tests {
         (router, temp_dir)
     }
 
-    #[tokio::test]
+    // The handlers reach TieredEngine, which uses block_in_place; that panics on
+    // the current-thread runtime #[tokio::test] gives you by default. See the same
+    // note in engine/tiered.rs.
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_health_endpoint() {
         let (app, _temp) = create_test_app();
 
@@ -138,7 +141,7 @@ mod tests {
         assert_eq!(json["status"], "healthy");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_stats_endpoint() {
         let (app, _temp) = create_test_app();
 
@@ -161,7 +164,7 @@ mod tests {
         assert!(json.get("disk_entries").is_some());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_put_and_get_key() {
         let temp_dir = TempDir::new().unwrap();
         let config = EngineConfig {
@@ -216,7 +219,7 @@ mod tests {
         assert_eq!(json["tier"], "memory");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_get_nonexistent_key_returns_404() {
         let (app, _temp) = create_test_app();
 
@@ -233,7 +236,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_delete_key() {
         let temp_dir = TempDir::new().unwrap();
         let config = EngineConfig {
@@ -298,7 +301,7 @@ mod tests {
         assert_eq!(get_response.status(), StatusCode::NOT_FOUND);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_head_key() {
         let temp_dir = TempDir::new().unwrap();
         let config = EngineConfig {
@@ -359,7 +362,7 @@ mod tests {
         assert_eq!(head_response.status(), StatusCode::OK);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_flush_endpoint() {
         let (app, _temp) = create_test_app();
 

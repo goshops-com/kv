@@ -565,7 +565,12 @@ mod tests {
 
     // ==================== BASIC OPERATIONS ====================
 
-    #[tokio::test]
+    // Every test here drives TieredEngine's get/put/delete/contains paths, which
+    // call tokio::task::block_in_place to keep blocking RocksDB work off the async
+    // runtime. block_in_place panics with "can call blocking only when running on
+    // the multi-threaded runtime" under #[tokio::test]'s default current-thread
+    // runtime, so these all need flavor = "multi_thread".
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_put_and_get() {
         let (engine, _temp) = create_test_engine();
 
@@ -579,7 +584,7 @@ mod tests {
         assert_eq!(result.unwrap().value, value);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_get_nonexistent_returns_none() {
         let (engine, _temp) = create_test_engine();
 
@@ -587,7 +592,7 @@ mod tests {
         assert!(result.is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_delete() {
         let (engine, _temp) = create_test_engine();
 
@@ -599,7 +604,7 @@ mod tests {
         assert!(!engine.contains(b"key1").await.unwrap());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_delete_nonexistent_returns_false() {
         let (engine, _temp) = create_test_engine();
 
@@ -607,7 +612,7 @@ mod tests {
         assert!(!deleted);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_contains() {
         let (engine, _temp) = create_test_engine();
 
@@ -619,7 +624,7 @@ mod tests {
 
     // ==================== TIERED ACCESS ====================
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_get_from_cache() {
         let (engine, _temp) = create_test_engine();
 
@@ -629,7 +634,7 @@ mod tests {
         assert_eq!(result.tier, StorageTier::Memory);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_get_from_disk_promotes_to_cache() {
         let (engine, _temp) = create_test_engine();
 
@@ -646,7 +651,7 @@ mod tests {
         assert_eq!(result2.tier, StorageTier::Memory);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_get_from_object_storage_promotes_to_cache() {
         let (engine, _temp) = create_test_engine();
 
@@ -705,7 +710,7 @@ mod tests {
 
     // ==================== STATISTICS ====================
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_stats() {
         let (engine, _temp) = create_test_engine();
 
@@ -724,7 +729,7 @@ mod tests {
         assert!(stats.memory_misses >= 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_disk_usage_percent() {
         let (engine, _temp) = create_test_engine();
 
@@ -738,7 +743,7 @@ mod tests {
 
     // ==================== DURABILITY ====================
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_data_persists_after_flush() {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().to_string_lossy().to_string();
@@ -778,7 +783,7 @@ mod tests {
 
     // ==================== DELETE FROM ALL TIERS ====================
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_delete_removes_from_all_tiers() {
         let (engine, _temp) = create_test_engine();
 
