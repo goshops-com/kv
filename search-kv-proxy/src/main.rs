@@ -122,7 +122,16 @@ async fn proxy_kv(
             let status =
                 StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let ct = resp.headers().get(reqwest::header::CONTENT_TYPE).cloned();
-            let bytes = resp.bytes().await.unwrap_or_default();
+            // A body that fails to arrive (shard died mid-response, timeout) must not
+            // be relayed as the shard's status with an empty body: a client would
+            // read an empty 200 as a valid, empty value.
+            let bytes = match resp.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    error!("reading shard response from {url} failed: {e}");
+                    return (StatusCode::BAD_GATEWAY, format!("shard proxy error: {e}")).into_response();
+                }
+            };
             let mut builder = Response::builder().status(status);
             if let Some(ct) = ct {
                 builder = builder.header(CONTENT_TYPE, ct.as_bytes());
@@ -155,6 +164,8 @@ async fn main() {
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(env_parse("SHARD_TIMEOUT_SECS", 5)))
+        // Fail fast on a shard that is down instead of spending the whole budget
+        .connect_timeout(Duration::from_millis(env_parse("SHARD_CONNECT_TIMEOUT_MS", 500)))
         .pool_max_idle_per_host(env_parse("POOL_MAX_IDLE_PER_HOST", 64))
         .build()
         .expect("failed to build reqwest client");
