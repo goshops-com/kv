@@ -54,15 +54,17 @@ spec:
             # Return freed pages to the OS promptly (same as tieredkv)
             - name: _RJEM_MALLOC_CONF
               value: "background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000"
-          # Measured 2026-09 (7d, before the expiry index): 0.27 cores avg, 0.48
-          # max; 2.7-5.3Gi RSS. Requests now reflect real usage so the scheduler
-          # reserves it; the 8Gi limit leaves room for page cache.
+          # Measured 2026-09-28 after the expiry index: ~0.02-0.05 cores (was 0.27,
+          # nearly all of it the full-scan TTL sweep) and ~1.25Gi anon (was
+          # 2.7-5.3Gi). With both caches full (1GB L1 + 512MB block cache) anon
+          # should settle near 2Gi. The limit bounds page cache: at 8Gi it filled
+          # to ~6.7Gi and made `kubectl top` look like nothing changed.
           resources:
             requests:
-              memory: "4Gi"
-              cpu: "500m"
+              memory: "2Gi"
+              cpu: "100m"
             limits:
-              memory: "8Gi"
+              memory: "3Gi"
               cpu: "2"
           volumeMounts:
             - name: data
