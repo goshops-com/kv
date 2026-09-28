@@ -30,7 +30,7 @@ A high-performance, tiered key-value store written in Rust with automatic data l
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                         HTTP API Layer                           │
-│            GET/PUT/DELETE /kv/:key  •  /health  •  /stats        │
+│   GET/PUT/DELETE /kv/:key  •  /health  •  /stats  •  /metrics    │
 ├─────────────────────────────────────────────────────────────────┤
 │                        Tiered Engine                             │
 │                                                                  │
@@ -100,22 +100,77 @@ Configure via environment variables:
 | `S3_BUCKET` | `tieredkv-data` | S3 bucket name |
 | `S3_REGION` | `us-east-1` | S3 region |
 | `S3_ENDPOINT` | - | Custom S3 endpoint (for MinIO) |
+| `CACHE_ONLY` | `false` | Disable migration to / reads from object storage. Forced on when no object-storage credentials are set |
+| `TTL_RULES` | - | Prefix TTLs, e.g. `CAD/:7d,tmp/:1h` (s/m/h/d). Changing them rebuilds the expiry index once on startup |
+| `TTL_CLEANUP_INTERVAL_SECS` | `60` | How often the TTL sweep runs |
+| `MAX_CONCURRENT_REQUESTS` | `128` | In-flight limit for `/kv`, `/admin`, `/debug` (not `/health`, `/stats`, `/metrics`) |
+| `FLUSH_EVERY_N_WRITES` | `0` | Force a memtable flush every N writes (0 = never; the WAL is durable) |
+| `RESERIALIZE_ON_STARTUP` | `false` | Convert legacy JSON entries to MessagePack on startup |
+| `ROCKSDB_BLOCK_CACHE_MB` | `256` | Block cache shared by all column families |
+| `ROCKSDB_CACHE_INDEX_AND_FILTER` | `false` | Keep index/filter blocks inside the block cache (bounded RAM) |
+| `ROCKSDB_WRITE_BUFFER_MB` / `ROCKSDB_MAX_WRITE_BUFFERS` / `ROCKSDB_DB_WRITE_BUFFER_MB` | `64` / `3` / `256` | Memtable sizing |
+| `ROCKSDB_MAX_BACKGROUND_JOBS` | `2` | Flush/compaction threads |
+| `ROCKSDB_MAX_OPEN_FILES` | `-1` | SST readers kept open |
+| `ROCKSDB_BLOB_COMPRESSION` | `none` | `none` or `zstd`. Values arrive zstd-compressed already |
+| `ROCKSDB_BLOB_GC_AGE_CUTOFF` | `0.05` | Share of oldest blob files relocated on every compaction (`0` = no relocation) |
+| `ROCKSDB_BLOB_GC_FORCE_THRESHOLD` | `0.5` | Garbage ratio that forces collection of the oldest blob files |
+| `_RJEM_MALLOC_CONF` | - | jemalloc tuning, e.g. `background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000` |
 | `RUST_LOG` | `info` | Log level |
+
+### Expiry (TTL)
+
+A key expires at the earlier of its per-key `ttl` (from its last write) and the first
+matching `TTL_RULES` prefix (from creation). Expiry is enforced on read, so an expired key
+is never served, and a sweep deletes expired entries every `TTL_CLEANUP_INTERVAL_SECS`.
+
+Storage uses RocksDB column families so the sweep never reads values:
+
+| Column family | Contents |
+|---------------|----------|
+| `default` | key → entry (value + timestamps + per-key TTL); values > 4KB in blob files |
+| `meta` | key → expiry + write version (one per key; also answers existence checks) |
+| `expiry` | `[expires_at BE][key]` → empty; the sweep range-scans only the due front |
+| `sys` | internal state (backfill progress) |
+
+Data written before the index existed is indexed by a one-time, resumable backfill on
+startup (`kv_expiry_backfill_complete` turns 1 when done).
+
+### Data format and rollback
+
+Entries are written in format v2 (msgpack with the value as `bin`). v1 and legacy JSON
+entries are still read. A binary older than the expiry index cannot open a data dir that
+has the extra column families. To roll back, stop the pod and run, against the same volume:
+
+```bash
+DATA_DIR=/data tieredkv downgrade   # rewrites v2 entries as v1, drops meta/expiry/sys
+```
 
 ## Kubernetes Deployment
 
-### Deploy with Kustomize
+### Manifests
+
+Both production deployments run the same image:
+
+| Deployment | Manifests | Callers |
+|------------|-----------|---------|
+| `tieredkv` (3 shards) | `k8s/statefulset.yaml`, `k8s/configmap.yaml`, `k8s/service.yaml` | `feature-store-v2`, which shards client-side over per-pod DNS |
+| `search-kv` (2 shards, cache-only) | `k8s/search-kv/` | `search-kv-proxy` (consistent hash) |
 
 ```bash
-# Deploy 3 shards
-kubectl apply -k k8s/
+# ConfigMaps and Services
+kubectl apply -f k8s/configmap.yaml -f k8s/search-kv/configmap.yaml
 
-# Check status
-kubectl get pods -l app=tieredkv
+# StatefulSets: use replace, not apply. apply's 3-way merge keeps env vars that were
+# added to the live object outside these files.
+kubectl replace -f k8s/statefulset.yaml
+kubectl replace -f k8s/search-kv/statefulset.yaml
 
-# Scale to 5 shards
-kubectl scale statefulset tieredkv --replicas=5
+kubectl rollout status sts/tieredkv
 ```
+
+Changing the number of shards moves keys between them; it is a resharding, not a scale-out.
+Restarting a shard makes its keys unavailable for ~60-90s (pod termination plus the
+negative DNS cache on its per-pod name).
 
 ### Architecture in Kubernetes
 
@@ -164,6 +219,8 @@ kubectl scale statefulset tieredkv --replicas=5
 |--------|----------|-------------|
 | `GET` | `/health` | Health check |
 | `GET` | `/stats` | Engine statistics |
+| `GET` | `/metrics` | Prometheus metrics: latency by route/method/status, GET outcome by tier, TTL sweep, backfill, L1 cache and RocksDB properties |
+| `GET` | `/debug/profile?seconds=N` | CPU flamegraph (SVG), max 60s |
 | `POST` | `/admin/migrate` | Trigger migration |
 | `POST` | `/admin/flush` | Flush to disk |
 
@@ -219,16 +276,16 @@ Client Request
       │
       ▼
 ┌─────────────┐
-│   Check     │──── Hit ───▶ Return
+│   Check     │──── Hit (not expired) ───▶ Return
 │   Cache     │
 └─────────────┘
       │ Miss
       ▼
 ┌─────────────┐
-│   Check     │──── Hit ───▶ Promote to Cache ──▶ Return
+│   Check     │──── Hit (not expired) ───▶ Promote to Cache ──▶ Return
 │    Disk     │
 └─────────────┘
-      │ Miss
+      │ Miss (skipped in cache-only mode)
       ▼
 ┌─────────────┐
 │   Check     │──── Hit ───▶ Promote to Cache ──▶ Return
@@ -298,8 +355,9 @@ cargo test -- --nocapture
 
 ## Performance Considerations
 
-- **Memory Cache**: Sub-microsecond reads for cached data
-- **Disk Storage**: Millisecond reads with LSM-tree optimization
+- **Memory Cache**: 16 independently locked LRU shards (caches >= 64MB); values held compressed, as exact-size allocations
+- **Disk Storage**: Millisecond reads with LSM-tree optimization; bloom filters for absent keys
+- **TTL sweep**: proportional to what expired, not to the size of the store (measured on search-kv, 6.3M keys: 0.27 → 0.03 cores, 3.7 → 0.02 MB/s disk reads)
 - **Object Storage**: Higher latency, used for cold/archived data
 - **Consistent Hashing**: O(log n) shard lookup with 150 virtual nodes per shard
 
