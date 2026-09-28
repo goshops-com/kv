@@ -6,27 +6,24 @@ metadata:
     app: tieredkv
 data:
   # Memory cache settings
-  # Lowered 2048→1024 (2026-04-22) per observation that most of RSS is kernel page cache,
-  # not the L1 LRU. Halves the app-controlled heap budget, small latency trade-off on L1 misses.
-  MEMORY_MAX_SIZE_MB: "1024"
+  MEMORY_MAX_SIZE_MB: "512"
   MEMORY_MAX_ENTRIES: "500000"
 
-  # RocksDB tuning (exposed as env vars in 2026-04-21 patch)
-  ROCKSDB_BLOCK_CACHE_MB: "128"
+  # RocksDB tuning
+  ROCKSDB_BLOCK_CACHE_MB: "64"
   ROCKSDB_WRITE_BUFFER_MB: "32"
   ROCKSDB_MAX_WRITE_BUFFERS: "2"
   ROCKSDB_MAX_WAL_MB: "64"
-  ROCKSDB_DB_WRITE_BUFFER_MB: "256"
+  ROCKSDB_DB_WRITE_BUFFER_MB: "128"
 
   # Disk settings
   DISK_MAX_SIZE_GB: "50"
   DISK_MIGRATION_AGE_HOURS: "24"
 
-  # Object storage (Azure Blob)
+  # Object storage (only used if Azure credentials are provided; see statefulset)
   S3_BUCKET: "tieredkv"
   S3_PREFIX: "data/"
 
-  # Sharding settings
   VIRTUAL_NODES: "150"
   SERVICE_NAME: "tieredkv"
 
@@ -35,9 +32,11 @@ data:
   MIGRATION_THRESHOLD_PERCENT: "80"
   MIGRATION_INTERVAL_SECS: "60"
 
-  # TTL rules: prefix:duration (keys not matching any rule live forever)
+  # TTL rules: prefix:duration (keys not matching any rule live forever).
+  # Changing this triggers a one-time rebuild of the expiry index on startup.
   TTL_RULES: "CAD/:7d"
-  TTL_CLEANUP_INTERVAL_SECS: "300"
+  # The sweep reads only the due range of the expiry index; it is cheap to run often.
+  TTL_CLEANUP_INTERVAL_SECS: "60"
 
   # Server settings
   HTTP_PORT: "8080"

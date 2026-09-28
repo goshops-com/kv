@@ -1,0 +1,30 @@
+# Headless: per-pod DNS for search-kv-proxy (search-kv-N.search-kv...)
+apiVersion: v1
+kind: Service
+metadata:
+  name: search-kv
+  labels:
+    app: search-kv
+spec:
+  clusterIP: None
+  selector:
+    app: search-kv
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: search-kv-lb
+  labels:
+    app: search-kv
+spec:
+  type: ClusterIP
+  selector:
+    app: search-kv
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

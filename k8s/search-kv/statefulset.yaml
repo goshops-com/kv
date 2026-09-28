@@ -1,45 +1,47 @@
+# search-kv: 2 cache-only shards behind search-kv-proxy (consistent hashing).
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: tieredkv
+  name: search-kv
   labels:
-    app: tieredkv
+    app: search-kv
 spec:
-  serviceName: tieredkv
-  replicas: 3
+  serviceName: search-kv
+  replicas: 2
   podManagementPolicy: Parallel
   persistentVolumeClaimRetentionPolicy:
     whenDeleted: Retain
     whenScaled: Retain
+  # Canary: with partition 1 only search-kv-1 picks up a new template. Set to 0
+  # to roll search-kv-0 as well.
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 0
   selector:
     matchLabels:
-      app: tieredkv
+      app: search-kv
   template:
     metadata:
       labels:
-        app: tieredkv
+        app: search-kv
     spec:
       terminationGracePeriodSeconds: 30
       imagePullSecrets:
         - name: regcred
       nodeSelector:
-        agentpool: qdrantpool
+        agentpool: agentpool3
       containers:
-        - name: tieredkv
+        - name: search-kv
           image: goshops/kv:expiry-index-amd64-20260928
           imagePullPolicy: IfNotPresent
-          # The named port is what the tieredkv / tieredkv-lb services target
-          # (targetPort: http). Without it both services have no endpoints.
           ports:
             - name: http
               containerPort: 8080
               protocol: TCP
           envFrom:
             - configMapRef:
-                name: tieredkv-config
-            # No object-storage credentials on purpose: tieredkv runs cache-only
-            # (everything on the local volume). Adding tieredkv-azure-credentials
-            # here re-enables migration to Azure and object-tier reads on misses.
+                name: search-kv-config
           env:
             - name: POD_NAME
               valueFrom:
@@ -49,27 +51,26 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-            # No TOTAL_SHARDS: feature-store-v2 routes keys client-side
-            # (KV_SHARDS=3), and the shards stay routing-agnostic.
+            # Return freed pages to the OS promptly (same as tieredkv)
             - name: _RJEM_MALLOC_CONF
               value: "background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000"
-          # Measured 2026-09 (7d): 0.05 cores avg, 0.33 max; 1.5-1.9Gi RSS. The
-          # rest of what `kubectl top` shows is page cache, which a lower limit
-          # simply trims (and leaves to qdrant on the same pool).
+          # Measured 2026-09 (7d, before the expiry index): 0.27 cores avg, 0.48
+          # max; 2.7-5.3Gi RSS. Requests now reflect real usage so the scheduler
+          # reserves it; the 8Gi limit leaves room for page cache.
           resources:
             requests:
-              memory: "2Gi"
-              cpu: "200m"
-            limits:
               memory: "4Gi"
-              cpu: "1"
+              cpu: "500m"
+            limits:
+              memory: "8Gi"
+              cpu: "2"
           volumeMounts:
             - name: data
               mountPath: /data
           livenessProbe:
             httpGet:
               path: /health
-              port: 8080
+              port: http
             initialDelaySeconds: 120
             periodSeconds: 10
             timeoutSeconds: 30
@@ -77,10 +78,10 @@ spec:
           readinessProbe:
             httpGet:
               path: /health
-              port: 8080
+              port: http
             initialDelaySeconds: 5
             periodSeconds: 5
-            timeoutSeconds: 10
+            timeoutSeconds: 30
             failureThreshold: 30
   volumeClaimTemplates:
     - metadata:

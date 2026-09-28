@@ -1,0 +1,49 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: search-kv-config
+  labels:
+    app: search-kv
+data:
+  SERVICE_NAME: "search-kv"
+  HTTP_PORT: "8080"
+  RUST_LOG: "info"
+  VIRTUAL_NODES: "150"
+
+  # Cache-only: no migration to object storage, misses never go to it
+  CACHE_ONLY: "true"
+  S3_BUCKET: "search-kv"
+  S3_PREFIX: "data/"
+  DISK_MAX_SIZE_GB: "45"
+  DISK_MIGRATION_AGE_HOURS: "24"
+  MIGRATION_BATCH_SIZE: "100"
+  MIGRATION_INTERVAL_SECS: "60"
+  MIGRATION_THRESHOLD_PERCENT: "80"
+
+  MEMORY_MAX_SIZE_MB: "1024"
+  MEMORY_MAX_ENTRIES: "250000"
+
+  ROCKSDB_BLOCK_CACHE_MB: "512"
+  ROCKSDB_CACHE_INDEX_AND_FILTER: "true"
+  ROCKSDB_DB_WRITE_BUFFER_MB: "384"
+  ROCKSDB_MAX_BACKGROUND_JOBS: "6"
+  ROCKSDB_MAX_OPEN_FILES: "1500"
+  ROCKSDB_MAX_WRITE_BUFFERS: "4"
+  ROCKSDB_WRITE_BUFFER_MB: "96"
+  # Stop blob GC from relocating live blobs. Even at 0.05 it rewrote the whole
+  # ~49GB value set every ~6.5h (4.5TB of blob read+write in 24 days for 290GB
+  # ingested). Keys here carry TTLs and blob files are written in time order,
+  # so files die whole as their keys expire. Watch
+  # kv_rocksdb_property{name="rocksdb.live-blob-file-garbage-size"}; to revert,
+  # remove this (default 0.05).
+  ROCKSDB_BLOB_GC_AGE_CUTOFF: "0"
+
+  # Forced flush every N writes made tiny L0/blob files; the WAL is enough
+  FLUSH_EVERY_N_WRITES: "0"
+  RESERIALIZE_ON_STARTUP: "false"
+
+  # The sweep reads only the due range of the expiry index
+  TTL_CLEANUP_INTERVAL_SECS: "60"
+
+  SCRUB_INTERVAL_SECS: "86400"
+  SCRUB_TOTAL_SHARDS: "0"
