@@ -28,6 +28,8 @@ thread_local! {
     // fresh context per value (what `encode_all`/`decode_all` do) showed up as
     // ZSTD_createDCtx in CPU profiles.
     static ZSTD_COMPRESSOR: RefCell<Option<zstd::bulk::Compressor<'static>>> = const { RefCell::new(None) };
+    // Worst-case-sized scratch output for the compressor, reused across calls
+    static ZSTD_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     static ZSTD_DECOMPRESSOR: RefCell<Option<zstd::bulk::Decompressor<'static>>> = const { RefCell::new(None) };
 }
 
@@ -37,15 +39,35 @@ fn zstd_err(e: std::io::Error) -> EngineError {
 
 /// Compress a value with zstd (level 1 = fast). The frame records its content
 /// size, so decompression can allocate the output exactly once.
-fn compress_value(data: &[u8]) -> Result<Bytes, EngineError> {
+///
+/// The result is an exact-size allocation. `bulk::Compressor::compress` returns a
+/// Vec with worst-case capacity (about the *uncompressed* size), and wrapping that
+/// in `Bytes` keeps the whole capacity alive: every value held by the L1 cache
+/// then pinned ~4.7x the bytes the cache accounted for (search-kv grew to 5Gi of
+/// anon with a "1GB" cache).
+fn compress_to_vec(data: &[u8]) -> Result<Vec<u8>, EngineError> {
     ZSTD_COMPRESSOR.with(|cell| {
         let mut slot = cell.borrow_mut();
         if slot.is_none() {
             *slot = Some(zstd::bulk::Compressor::new(1).map_err(zstd_err)?);
         }
-        let compressed = slot.as_mut().unwrap().compress(data).map_err(zstd_err)?;
-        Ok(Bytes::from(compressed))
+        ZSTD_SCRATCH.with(|scratch| {
+            let mut buf = scratch.borrow_mut();
+            buf.clear();
+            buf.reserve(zstd::zstd_safe::compress_bound(data.len()));
+            slot.as_mut().unwrap().compress_to_buffer(data, &mut *buf).map_err(zstd_err)?;
+            let out = buf.as_slice().to_vec();
+            // Don't let one huge value pin a huge scratch buffer on this thread
+            if buf.capacity() > 4 * 1024 * 1024 {
+                *buf = Vec::new();
+            }
+            Ok(out)
+        })
     })
+}
+
+fn compress_value(data: &[u8]) -> Result<Bytes, EngineError> {
+    Ok(Bytes::from(compress_to_vec(data)?))
 }
 
 /// Decompress if the value starts with zstd magic, otherwise return as-is.
@@ -1016,6 +1038,16 @@ mod tests {
             .unwrap();
         assert!(engine.get(b"remote").await.unwrap().is_none());
         assert!(!engine.contains(b"remote").await.unwrap());
+    }
+
+    #[test]
+    fn test_compressed_values_are_exact_size_allocations() {
+        let data = "{\"a\":1,\"b\":\"xyz\"}".repeat(10_000);
+        for _ in 0..3 {
+            let v = compress_to_vec(data.as_bytes()).unwrap();
+            assert_eq!(v.capacity(), v.len());
+            assert!(v.len() < data.len() / 10);
+        }
     }
 
     #[test]
