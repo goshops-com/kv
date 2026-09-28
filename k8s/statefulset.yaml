@@ -26,7 +26,7 @@ spec:
         agentpool: qdrantpool
       containers:
         - name: tieredkv
-          image: goshops/kv:expiry-index-amd64-20260928
+          image: goshops/kv:expiry-index-memfix-amd64-20260928
           imagePullPolicy: IfNotPresent
           # The named port is what the tieredkv / tieredkv-lb services target
           # (targetPort: http). Without it both services have no endpoints.

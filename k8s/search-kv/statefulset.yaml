@@ -33,7 +33,7 @@ spec:
         agentpool: agentpool3
       containers:
         - name: search-kv
-          image: goshops/kv:expiry-index-amd64-20260928
+          image: goshops/kv:expiry-index-memfix-amd64-20260928
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
