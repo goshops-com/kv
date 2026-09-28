@@ -5,8 +5,8 @@ metadata:
   labels:
     app: tieredkv
 data:
-  # Memory cache settings
-  MEMORY_MAX_SIZE_MB: "512"
+  # Memory cache settings (<1 req/s per shard: a bigger L1 buys nothing)
+  MEMORY_MAX_SIZE_MB: "256"
   MEMORY_MAX_ENTRIES: "500000"
 
   # RocksDB tuning

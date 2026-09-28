@@ -53,15 +53,17 @@ spec:
             # (KV_SHARDS=3), and the shards stay routing-agnostic.
             - name: _RJEM_MALLOC_CONF
               value: "background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000"
-          # Measured 2026-09 (7d): 0.05 cores avg, 0.33 max; 1.5-1.9Gi RSS. The
-          # rest of what `kubectl top` shows is page cache, which a lower limit
-          # simply trims (and leaves to qdrant on the same pool).
+          # Measured 2026-09-28 after the expiry-index rollout: <1 req/s per pod,
+          # ~1m CPU, ~0.1Gi anon. Worst-case anon with tieredkv-config is ~0.6Gi
+          # (256MB L1 + 64MB block cache + 128MB memtables + allocator). Everything
+          # above that is page cache over the ~8GB data dir, which the limit just
+          # trims (and leaves to qdrant on the same pool).
           resources:
             requests:
-              memory: "2Gi"
-              cpu: "200m"
+              memory: "512Mi"
+              cpu: "50m"
             limits:
-              memory: "4Gi"
+              memory: "1536Mi"
               cpu: "1"
           volumeMounts:
             - name: data
