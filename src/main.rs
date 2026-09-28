@@ -75,8 +75,24 @@ async fn main() {
 
     info!("TieredKV v{} starting...", env!("CARGO_PKG_VERSION"));
 
+    // `tieredkv downgrade`: make DATA_DIR readable by the binary that predates the
+    // expiry index / entry format v2, then exit. Run with the service stopped.
+    if env::args().nth(1).as_deref() == Some("downgrade") {
+        let data_dir = get_env_or("DATA_DIR", "./data".to_string());
+        match tieredkv::disk::downgrade_data_dir(&data_dir) {
+            Ok(n) => {
+                info!("Downgrade complete: {} entries rewritten as v1 in {}", n, data_dir);
+                return;
+            }
+            Err(e) => {
+                tracing::error!("Downgrade failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Build configuration from environment
-    let config = EngineConfig {
+    let mut config = EngineConfig {
         memory: CacheConfig {
             max_size_bytes: get_env_or("MEMORY_MAX_SIZE_MB", 256) * 1024 * 1024,
             max_entries: Some(get_env_or("MEMORY_MAX_ENTRIES", 100_000)),
@@ -85,7 +101,8 @@ async fn main() {
             data_dir: get_env_or("DATA_DIR", "./data".to_string()),
             max_size_bytes: get_env_or("DISK_MAX_SIZE_GB", 50) * 1024 * 1024 * 1024,
             migration_age_secs: get_env_or("DISK_MIGRATION_AGE_HOURS", 24) * 3600,
-            flush_every_n_writes: get_env_or("FLUSH_EVERY_N_WRITES", 1000),
+            // 0 = never force a flush; the WAL already makes writes durable
+            flush_every_n_writes: get_env_or("FLUSH_EVERY_N_WRITES", 0),
         },
         object: ObjectConfig {
             bucket: get_env_or("S3_BUCKET", "tieredkv-data".to_string()),
@@ -102,6 +119,17 @@ async fn main() {
     };
 
     let port = get_env_or("HTTP_PORT", 8080u16);
+
+    // Without object storage credentials the object tier is an in-memory map:
+    // migrating to it would move data off disk into RAM and lose it on restart,
+    // and reading from it on every miss is pointless. Run cache-only instead.
+    let has_object_store = cfg!(feature = "azure")
+        && config.object.azure_account.is_some()
+        && config.object.azure_access_key.is_some();
+    if !has_object_store && !config.cache_only {
+        warn!("No object storage credentials: running cache-only (no migration, no object-tier reads)");
+        config.cache_only = true;
+    }
 
     info!("Configuration loaded:");
     info!("  Memory: {}MB max, {} max entries",
@@ -147,6 +175,7 @@ async fn main() {
     tokio::spawn(async move {
         let interval_secs = get_env_or("MIGRATION_INTERVAL_SECS", 60u64);
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             interval.tick().await;
@@ -176,7 +205,7 @@ async fn main() {
         // scan can finish — which restarts it and re-runs the scan from scratch, an
         // infinite crash loop. It is a *completed* migration, so make it opt-out:
         // shards that have nothing left to convert set RESERIALIZE_ON_STARTUP=false.
-        if !get_env_or("RESERIALIZE_ON_STARTUP", true) {
+        if !get_env_or("RESERIALIZE_ON_STARTUP", false) {
             info!("Legacy re-serialization skipped (RESERIALIZE_ON_STARTUP=false)");
             return;
         }
@@ -209,18 +238,33 @@ async fn main() {
         }
     });
 
-    // Start background TTL cleanup task
+    // Build the expiry index for entries that predate it (one-time, resumable)
+    let backfill_engine = engine.clone();
+    tokio::spawn(async move {
+        // Let startup traffic settle first
+        tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+        loop {
+            match backfill_engine.run_expiry_backfill().await {
+                Ok(()) => break,
+                Err(e) => {
+                    warn!("Expiry index backfill failed: {}, retrying in 60s", e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                }
+            }
+        }
+    });
+
+    // Start background TTL cleanup task. A sweep reads only the due front of the
+    // expiry index, so it can run often.
     let ttl_engine = engine.clone();
     tokio::spawn(async move {
-        let interval_secs = get_env_or("TTL_CLEANUP_INTERVAL_SECS", 300u64);
+        let interval_secs = get_env_or("TTL_CLEANUP_INTERVAL_SECS", 60u64);
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             interval.tick().await;
             match ttl_engine.run_ttl_cleanup().await {
-                Ok(count) if count > 0 => {
-                    info!("TTL cleanup: removed {} expired entries", count);
-                }
                 Ok(_) => {}
                 Err(e) => {
                     warn!("TTL cleanup failed: {}", e);

@@ -4,6 +4,7 @@
 
 use axum::{
     extract::DefaultBodyLimit,
+    middleware,
     routing::{delete, get, head, post, put},
     Router,
 };
@@ -53,17 +54,17 @@ pub fn create_router(state: AppState) -> Router {
     // is GLOBAL (one shared semaphore across all connections/clones): requests past the
     // limit wait for a permit *before* the handler runs its body extractor, so nothing
     // is buffered while queued. Tunable without a rebuild via MAX_CONCURRENT_REQUESTS.
+    //
+    // 128 (was 512): at 512 a slow disk let up to 512 requests each hold a body and
+    // a blocking-pool thread; with 3-4 cores nothing is gained past a few dozen.
     let max_concurrent = std::env::var("MAX_CONCURRENT_REQUESTS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(512);
+        .unwrap_or(128);
 
-    Router::new()
-        // Health and stats
-        .route("/health", get(handlers::health))
-        .route("/stats", get(handlers::stats))
-        // Key-value operations
+    // Data-plane routes share the concurrency limit.
+    let data = Router::new()
         .route("/kv/*key", get(handlers::get_key))
         .route("/kv/*key", put(handlers::put_key))
         .route("/kv/*key", delete(handlers::delete_key))
@@ -76,7 +77,18 @@ pub fn create_router(state: AppState) -> Router {
         // Middleware. Order matters: the concurrency limit sits OUTSIDE the body
         // limit / handler so its permit is acquired before any body is read.
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024)) // 64MB per-request ceiling
-        .layer(GlobalConcurrencyLimitLayer::new(max_concurrent))
+        .layer(GlobalConcurrencyLimitLayer::new(max_concurrent));
+
+    // Health, stats and metrics stay outside the limit: when every slot is held
+    // (slow disk, compaction stall) the liveness probe must still be answered, or
+    // the kubelet kills a pod that is merely busy.
+    let ops = Router::new()
+        .route("/health", get(handlers::health))
+        .route("/stats", get(handlers::stats))
+        .route("/metrics", get(handlers::metrics));
+
+    data.merge(ops)
+        .layer(middleware::from_fn(crate::metrics::track))
         .layer(TraceLayer::new_for_http())
         // State
         .with_state(state)
@@ -401,5 +413,66 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         assert!(json.get("migrated").is_some());
+    }
+
+    async fn send(app: &Router, method: &str, uri: &str, body: &str) -> (StatusCode, bytes::Bytes) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        (status, axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_embeds_json_values_raw_and_quotes_the_rest() {
+        let (app, _temp) = create_test_app();
+        let doc = r#"{"hits":[1,2,{"a":"\u00e9"}],"total":3}"#;
+        let put = serde_json::json!({ "value": doc }).to_string();
+        assert_eq!(send(&app, "PUT", "/kv/doc", &put).await.0, StatusCode::CREATED);
+        let (status, body) = send(&app, "GET", "/kv/doc", "").await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["key"], "doc");
+        assert_eq!(json["tier"], "memory");
+        assert_eq!(json["value"], serde_json::from_str::<serde_json::Value>(doc).unwrap());
+        // Embedded verbatim, not re-serialized
+        assert!(std::str::from_utf8(&body).unwrap().contains(doc));
+
+        let put = serde_json::json!({ "value": "not json {" }).to_string();
+        send(&app, "PUT", "/kv/plain", &put).await;
+        let (_, body) = send(&app, "GET", "/kv/plain", "").await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["value"], "not json {");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_expired_key_is_not_served() {
+        let (app, _temp) = create_test_app();
+        let put = serde_json::json!({ "value": "\"v\"", "ttl": 0 }).to_string();
+        assert_eq!(send(&app, "PUT", "/kv/short", &put).await.0, StatusCode::CREATED);
+        assert_eq!(send(&app, "GET", "/kv/short", "").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(send(&app, "HEAD", "/kv/short", "").await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_metrics_endpoint_reports_request_latency() {
+        let (app, _temp) = create_test_app();
+        send(&app, "GET", "/kv/missing", "").await;
+        let (status, body) = send(&app, "GET", "/metrics", "").await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains(r#"kv_http_request_duration_seconds_count{method="GET",route="/kv/*key",status="404"}"#), "{text}");
+        assert!(text.contains(r#"kv_get_results_total{result="miss"}"#));
+        assert!(text.contains(r#"kv_rocksdb_property{name="rocksdb.total-blob-file-size"}"#));
+        assert!(text.contains(r#"kv_memory_cache{stat="entries"}"#));
     }
 }

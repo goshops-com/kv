@@ -5,9 +5,10 @@
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use parking_lot::RwLock;
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use xxhash_rust::xxh3::xxh3_64;
 
 /// Configuration for the memory cache
 #[derive(Debug, Clone)]
@@ -34,6 +35,8 @@ pub struct CacheEntry {
     pub created_at: DateTime<Utc>,
     pub last_accessed: DateTime<Utc>,
     pub access_count: u64,
+    /// Unix seconds after which the entry is dead (0 = never expires)
+    pub expires_at: u64,
 }
 
 impl CacheEntry {
@@ -44,7 +47,12 @@ impl CacheEntry {
             created_at: now,
             last_accessed: now,
             access_count: 1,
+            expires_at: 0,
         }
+    }
+
+    fn is_expired(&self, now_secs: u64) -> bool {
+        self.expires_at != 0 && now_secs >= self.expires_at
     }
 
     fn size(&self) -> usize {
@@ -60,17 +68,14 @@ struct LruNode {
     next: Option<Bytes>,
 }
 
-/// Inner state of the cache (protected by RwLock)
+/// Inner state of one cache shard (protected by that shard's mutex)
 struct CacheInner {
     entries: HashMap<Bytes, CacheEntry>,
     // LRU tracking
     lru_order: HashMap<Bytes, LruNode>,
     lru_head: Option<Bytes>, // Most recently used
     lru_tail: Option<Bytes>, // Least recently used
-    // Stats
     current_size_bytes: usize,
-    hits: u64,
-    misses: u64,
 }
 
 impl CacheInner {
@@ -81,8 +86,6 @@ impl CacheInner {
             lru_head: None,
             lru_tail: None,
             current_size_bytes: 0,
-            hits: 0,
-            misses: 0,
         }
     }
 
@@ -190,51 +193,95 @@ impl CacheInner {
     }
 }
 
+/// Caches at least this big are split into `SHARDS` independently locked shards.
+/// Every lookup mutates LRU order, so a single cache-wide lock serializes all
+/// request threads on each GET; sharding by key hash spreads that contention.
+/// Small caches (tests, tiny configs) stay single-shard so their eviction order
+/// is exactly global LRU.
+const SHARD_THRESHOLD_BYTES: usize = 64 * 1024 * 1024;
+const SHARDS: usize = 16;
+
 /// Thread-safe LRU memory cache
 pub struct MemoryCache {
     config: CacheConfig,
-    inner: Arc<RwLock<CacheInner>>,
+    shards: Box<[Mutex<CacheInner>]>,
+    shard_max_bytes: usize,
+    shard_max_entries: Option<usize>,
+    hits: AtomicU64,
+    misses: AtomicU64,
+}
+
+fn now_secs() -> u64 {
+    Utc::now().timestamp().max(0) as u64
 }
 
 impl MemoryCache {
     /// Create a new memory cache with the given configuration
     pub fn new(config: CacheConfig) -> Self {
+        let n = if config.max_size_bytes >= SHARD_THRESHOLD_BYTES { SHARDS } else { 1 };
         Self {
+            shard_max_bytes: config.max_size_bytes / n,
+            shard_max_entries: config.max_entries.map(|m| (m / n).max(1)),
+            shards: (0..n).map(|_| Mutex::new(CacheInner::new())).collect(),
             config,
-            inner: Arc::new(RwLock::new(CacheInner::new())),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         }
     }
 
-    /// Get a value from the cache
+    fn shard(&self, key: &[u8]) -> &Mutex<CacheInner> {
+        if self.shards.len() == 1 {
+            return &self.shards[0];
+        }
+        &self.shards[(xxh3_64(key) % self.shards.len() as u64) as usize]
+    }
+
+    /// Get a value from the cache. Entries past their expiry are dropped and
+    /// reported as a miss.
     pub fn get(&self, key: &[u8]) -> Option<Bytes> {
         let key = Bytes::copy_from_slice(key);
-        let mut inner = self.inner.write();
+        let mut inner = self.shard(&key).lock();
 
-        let result = if let Some(entry) = inner.entries.get_mut(&key) {
-            entry.last_accessed = Utc::now();
-            entry.access_count += 1;
-            Some(entry.value.clone())
-        } else {
-            None
+        let expired = match inner.entries.get(&key) {
+            Some(entry) => entry.is_expired(now_secs()),
+            None => {
+                drop(inner);
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
         };
-
-        if result.is_some() {
-            inner.hits += 1;
-            inner.touch(&key);
-        } else {
-            inner.misses += 1;
+        if expired {
+            if let Some(entry) = inner.entries.remove(&key) {
+                inner.current_size_bytes = inner.current_size_bytes.saturating_sub(entry.size());
+                inner.remove_from_lru(&key);
+            }
+            drop(inner);
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
         }
 
-        result
+        let entry = inner.entries.get_mut(&key).expect("checked above");
+        entry.last_accessed = Utc::now();
+        entry.access_count += 1;
+        let value = entry.value.clone();
+        inner.touch(&key);
+        drop(inner);
+        self.hits.fetch_add(1, Ordering::Relaxed);
+        Some(value)
     }
 
-    /// Insert a value into the cache, evicting if necessary
+    /// Insert a value that never expires, evicting if necessary
     pub fn put(&self, key: &[u8], value: Bytes) -> Vec<(Bytes, CacheEntry)> {
+        self.put_with_expiry(key, value, 0)
+    }
+
+    /// Insert a value that expires at `expires_at` (unix seconds, 0 = never)
+    pub fn put_with_expiry(&self, key: &[u8], value: Bytes, expires_at: u64) -> Vec<(Bytes, CacheEntry)> {
         let key = Bytes::copy_from_slice(key);
         let entry_size = value.len();
         let mut evicted = Vec::new();
 
-        let mut inner = self.inner.write();
+        let mut inner = self.shard(&key).lock();
 
         // Remove existing entry if present
         if let Some(old_entry) = inner.entries.remove(&key) {
@@ -243,7 +290,7 @@ impl MemoryCache {
         }
 
         // Evict until we have space
-        while inner.current_size_bytes + entry_size > self.config.max_size_bytes {
+        while inner.current_size_bytes + entry_size > self.shard_max_bytes {
             if let Some((evicted_key, evicted_entry)) = inner.evict_lru() {
                 evicted.push((evicted_key, evicted_entry));
             } else {
@@ -252,7 +299,7 @@ impl MemoryCache {
         }
 
         // Check entry count limit
-        if let Some(max_entries) = self.config.max_entries {
+        if let Some(max_entries) = self.shard_max_entries {
             while inner.entries.len() >= max_entries {
                 if let Some((evicted_key, evicted_entry)) = inner.evict_lru() {
                     evicted.push((evicted_key, evicted_entry));
@@ -263,7 +310,8 @@ impl MemoryCache {
         }
 
         // Insert new entry
-        let entry = CacheEntry::new(value);
+        let mut entry = CacheEntry::new(value);
+        entry.expires_at = expires_at;
         inner.current_size_bytes += entry_size;
         inner.entries.insert(key.clone(), entry);
         inner.add_to_lru(key);
@@ -274,7 +322,7 @@ impl MemoryCache {
     /// Remove a value from the cache
     pub fn delete(&self, key: &[u8]) -> Option<CacheEntry> {
         let key = Bytes::copy_from_slice(key);
-        let mut inner = self.inner.write();
+        let mut inner = self.shard(&key).lock();
 
         if let Some(entry) = inner.entries.remove(&key) {
             inner.current_size_bytes = inner.current_size_bytes.saturating_sub(entry.size());
@@ -285,39 +333,50 @@ impl MemoryCache {
         }
     }
 
-    /// Check if a key exists in the cache (without updating LRU)
+    /// Check if a live (unexpired) key exists in the cache (without updating LRU)
     pub fn contains(&self, key: &[u8]) -> bool {
-        let key = Bytes::copy_from_slice(key);
-        let inner = self.inner.read();
-        inner.entries.contains_key(&key)
+        let inner = self.shard(key).lock();
+        inner
+            .entries
+            .get(key)
+            .is_some_and(|e| !e.is_expired(now_secs()))
     }
 
     /// Get current cache statistics
     pub fn stats(&self) -> CacheStats {
-        let inner = self.inner.read();
+        let (mut entries, mut size_bytes) = (0, 0);
+        for shard in self.shards.iter() {
+            let inner = shard.lock();
+            entries += inner.entries.len();
+            size_bytes += inner.current_size_bytes;
+        }
         CacheStats {
-            entries: inner.entries.len(),
-            size_bytes: inner.current_size_bytes,
+            entries,
+            size_bytes,
             max_size_bytes: self.config.max_size_bytes,
-            hits: inner.hits,
-            misses: inner.misses,
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
         }
     }
 
     /// Clear all entries from the cache
     pub fn clear(&self) {
-        let mut inner = self.inner.write();
-        inner.entries.clear();
-        inner.lru_order.clear();
-        inner.lru_head = None;
-        inner.lru_tail = None;
-        inner.current_size_bytes = 0;
+        for shard in self.shards.iter() {
+            let mut inner = shard.lock();
+            inner.entries.clear();
+            inner.lru_order.clear();
+            inner.lru_head = None;
+            inner.lru_tail = None;
+            inner.current_size_bytes = 0;
+        }
     }
 
     /// Get all keys in the cache (for testing/debugging)
     pub fn keys(&self) -> Vec<Bytes> {
-        let inner = self.inner.read();
-        inner.entries.keys().cloned().collect()
+        self.shards
+            .iter()
+            .flat_map(|shard| shard.lock().entries.keys().cloned().collect::<Vec<_>>())
+            .collect()
     }
 }
 
@@ -596,8 +655,60 @@ mod tests {
 
     // ==================== THREAD SAFETY ====================
 
+    // ==================== EXPIRY ====================
+
+    fn now() -> u64 {
+        Utc::now().timestamp() as u64
+    }
+
+    #[test]
+    fn test_expired_entry_is_a_miss_and_is_dropped() {
+        let cache = MemoryCache::new(CacheConfig::default());
+        cache.put_with_expiry(b"old", Bytes::from("v"), now() - 1);
+        cache.put_with_expiry(b"fresh", Bytes::from("v"), now() + 3600);
+        cache.put(b"forever", Bytes::from("v"));
+
+        assert!(!cache.contains(b"old"));
+        assert!(cache.get(b"old").is_none());
+        assert_eq!(cache.stats().entries, 2);
+        assert_eq!(cache.stats().size_bytes, 2);
+        assert!(cache.get(b"fresh").is_some());
+        assert!(cache.get(b"forever").is_some());
+    }
+
+    #[test]
+    fn test_overwrite_resets_expiry() {
+        let cache = MemoryCache::new(CacheConfig::default());
+        cache.put_with_expiry(b"k", Bytes::from("v1"), now() - 1);
+        cache.put(b"k", Bytes::from("v2"));
+        assert_eq!(cache.get(b"k"), Some(Bytes::from("v2")));
+    }
+
+    // ==================== SHARDING ====================
+
+    #[test]
+    fn test_large_cache_is_sharded_and_respects_budget() {
+        let cache = MemoryCache::new(CacheConfig {
+            max_size_bytes: 64 * 1024 * 1024,
+            max_entries: Some(1600),
+        });
+        assert_eq!(cache.shards.len(), SHARDS);
+        for i in 0..5000 {
+            cache.put(format!("key-{i}").as_bytes(), Bytes::from(vec![0u8; 1024]));
+        }
+        let stats = cache.stats();
+        assert!(stats.entries <= 1600, "entries {}", stats.entries);
+        assert!(stats.entries > 1000, "entries {}", stats.entries);
+        assert!(stats.size_bytes <= 64 * 1024 * 1024);
+        assert!(cache.get(b"key-4999").is_some());
+        assert_eq!(cache.keys().len(), stats.entries);
+        cache.clear();
+        assert_eq!(cache.stats().entries, 0);
+    }
+
     #[test]
     fn test_concurrent_access() {
+        use std::sync::Arc;
         use std::thread;
 
         let cache = Arc::new(MemoryCache::new(CacheConfig {

@@ -20,6 +20,7 @@ pub mod object;
 pub mod engine;
 pub mod api;
 pub mod cluster;
+pub mod metrics;
 
 // Re-export commonly used types
 pub use memory::{MemoryCache, CacheConfig};

@@ -1,3 +1,3 @@
 mod cache;
 
-pub use cache::{MemoryCache, CacheConfig, CacheEntry};
+pub use cache::{MemoryCache, CacheConfig, CacheEntry, CacheStats};

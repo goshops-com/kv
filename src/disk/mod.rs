@@ -1,3 +1,6 @@
 mod store;
 
-pub use store::{DiskStore, DiskConfig, DiskEntry, DiskError, MigrationCandidate, MigrationReason, StoredEntry};
+pub use store::{
+    downgrade_data_dir, BackfillState, DiskConfig, DiskEntry, DiskError, DiskStore,
+    MigrationCandidate, MigrationReason, StoredEntry, StoredEntryMeta,
+};

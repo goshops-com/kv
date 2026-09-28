@@ -5,8 +5,10 @@
 //! to the correct shard if the key doesn't belong to this node.
 
 use axum::{
+    body::Body,
     extract::{Path, State},
-    http::StatusCode,
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
     Json,
 };
 use bytes::Bytes;
@@ -22,8 +24,7 @@ pub struct PutRequest {
     pub ttl: Option<u64>,
 }
 
-/// Response for GET operations
-/// Uses RawValue for the value field to avoid re-serializing JSON-inside-JSON
+/// Response for GET operations (shape of the body `get_key` writes by hand)
 #[derive(Debug, Serialize)]
 pub struct GetResponse {
     pub key: String,
@@ -82,6 +83,36 @@ pub async fn health() -> Json<HealthResponse> {
     })
 }
 
+/// GET /metrics - Prometheus metrics
+pub async fn metrics(State(state): State<AppState>) -> Response {
+    let body = crate::metrics::render(&state.engine);
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        body,
+    )
+        .into_response()
+}
+
+/// Build the GET response body: `{"key":..,"value":<raw JSON>,"tier":..}`.
+/// Values are stored JSON documents, embedded verbatim (no re-parse into a tree,
+/// no re-escaping); anything that isn't valid JSON is embedded as a JSON string.
+/// Runs on the blocking pool: validating a large value is CPU-bound.
+fn get_response_body(key: &str, value: &[u8], tier: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(value.len() + key.len() + 48);
+    out.extend_from_slice(b"{\"key\":");
+    serde_json::to_writer(&mut out, key).expect("writing to a Vec");
+    out.extend_from_slice(b",\"value\":");
+    if serde_json::from_slice::<serde::de::IgnoredAny>(value).is_ok() {
+        out.extend_from_slice(value);
+    } else {
+        serde_json::to_writer(&mut out, String::from_utf8_lossy(value).as_ref()).expect("writing to a Vec");
+    }
+    out.extend_from_slice(b",\"tier\":");
+    serde_json::to_writer(&mut out, tier).expect("writing to a Vec");
+    out.push(b'}');
+    out
+}
+
 /// GET /stats - Get engine statistics
 pub async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
     let stats = state.engine.stats().await;
@@ -110,7 +141,7 @@ use crate::cluster::normalize_key;
 pub async fn get_key(
     State(state): State<AppState>,
     Path(raw_key): Path<String>,
-) -> Result<Json<GetResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
     let key = normalize_key(raw_key);
     // With client-side routing, reject keys that don't belong to this shard
     #[cfg(feature = "cluster")]
@@ -122,20 +153,14 @@ pub async fn get_key(
 
     match state.engine.get(key.as_bytes()).await {
         Ok(Some(entry)) => {
-            // Embed value as raw JSON (no re-parsing, no re-escaping of ~287KB)
-            let value_str = String::from_utf8_lossy(&entry.value);
-            let raw = serde_json::value::RawValue::from_string(value_str.into_owned())
-                .unwrap_or_else(|_| {
-                    // Fallback: if value isn't valid JSON, quote it as a JSON string
-                    serde_json::value::RawValue::from_string(
-                        serde_json::to_string(&String::from_utf8_lossy(&entry.value).as_ref()).unwrap()
-                    ).unwrap()
-                });
-            Ok(Json(GetResponse {
-                key,
-                value: raw,
-                tier: entry.tier.into(),
-            }))
+            let tier: String = entry.tier.into();
+            let body = tokio::task::spawn_blocking(move || get_response_body(&key, &entry.value, &tier))
+                .await
+                .map_err(|e| (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse { error: e.to_string(), code: "INTERNAL_ERROR".to_string() }),
+                ))?;
+            Ok(([(header::CONTENT_TYPE, "application/json")], Body::from(body)).into_response())
         }
         Ok(None) => Err(not_found(&key)),
         Err(e) => Err((
