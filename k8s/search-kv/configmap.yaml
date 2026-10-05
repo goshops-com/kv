@@ -30,13 +30,15 @@ data:
   ROCKSDB_MAX_OPEN_FILES: "1500"
   ROCKSDB_MAX_WRITE_BUFFERS: "4"
   ROCKSDB_WRITE_BUFFER_MB: "96"
-  # Stop blob GC from relocating live blobs. Even at 0.05 it rewrote the whole
-  # ~49GB value set every ~6.5h (4.5TB of blob read+write in 24 days for 290GB
-  # ingested). Keys here carry TTLs and blob files are written in time order,
-  # so files die whole as their keys expire. Watch
-  # kv_rocksdb_property{name="rocksdb.live-blob-file-garbage-size"}; to revert,
-  # remove this (default 0.05).
-  ROCKSDB_BLOB_GC_AGE_CUTOFF: "0"
+  # Blob GC relocates the live blobs of the oldest 5% of blob files on every
+  # compaction of the values. It costs I/O (at 0.05 it rewrote the ~49GB value
+  # set every ~6.5h), but 0 is not an option: it was tried from 2026-09-28 to
+  # 2026-10-05 expecting blob files to die whole as their keys expire, and they
+  # don't (one live key keeps a 256MB file). Nothing was reclaimed: both shards
+  # went from ~45GB to ~157GB (70% garbage), 16GB a day, on 200GB volumes.
+  # To spend less I/O try a value between 0 and 0.05, never 0, and watch
+  # kv_rocksdb_property{name="rocksdb.live-blob-file-garbage-size"}.
+  ROCKSDB_BLOB_GC_AGE_CUTOFF: "0.05"
 
   # Forced flush every N writes made tiny L0/blob files; the WAL is enough
   FLUSH_EVERY_N_WRITES: "0"

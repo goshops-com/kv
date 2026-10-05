@@ -63,8 +63,10 @@ spec:
             requests:
               memory: "2Gi"
               cpu: "100m"
+            # 3Gi was too tight: both shards were OOMKilled 10 times in the week
+            # after 2026-09-28 (peak working set 2.97-2.99Gi).
             limits:
-              memory: "3Gi"
+              memory: "4Gi"
               cpu: "2"
           volumeMounts:
             - name: data
