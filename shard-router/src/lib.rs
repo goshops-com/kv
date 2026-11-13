@@ -27,32 +27,11 @@ pub struct ShardConfig {
     pub shard_addresses: Vec<ShardAddress>,
 }
 
-impl Default for ShardConfig {
-    fn default() -> Self {
-        Self {
-            shard_id: 0,
-            total_shards: 1,
-            virtual_nodes: 150,
-            shard_addresses: vec![ShardAddress {
-                shard_id: 0,
-                address: "localhost:8080".to_string(),
-            }],
-        }
-    }
-}
-
 /// Address of a shard node
 #[derive(Debug, Clone, PartialEq)]
 pub struct ShardAddress {
     pub shard_id: u32,
     pub address: String,
-}
-
-/// A point on the consistent hash ring
-#[derive(Debug, Clone)]
-struct RingPoint {
-    hash: u64,
-    shard_id: u32,
 }
 
 /// Routes keys to shards using consistent hashing

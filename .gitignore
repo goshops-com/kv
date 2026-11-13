@@ -1,7 +1,7 @@
 # Rust
 /target/
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock va versionado: Dockerfile.proxy lo copia y CI buildea con --locked
 
 # IDE
 .idea/

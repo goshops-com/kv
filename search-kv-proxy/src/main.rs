@@ -147,6 +147,24 @@ async fn proxy_kv(
     }
 }
 
+fn build_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(env_parse("SHARD_TIMEOUT_SECS", 5)))
+        // Fail fast on a shard that is down instead of spending the whole budget
+        .connect_timeout(Duration::from_millis(env_parse("SHARD_CONNECT_TIMEOUT_MS", 500)))
+        .pool_max_idle_per_host(env_parse("POOL_MAX_IDLE_PER_HOST", 64))
+        .build()
+        .expect("failed to build reqwest client")
+}
+
+fn build_app(state: ProxyState, max_body_bytes: usize) -> Router {
+    Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .route("/kv/*key", any(proxy_kv))
+        .layer(DefaultBodyLimit::max(max_body_bytes))
+        .with_state(state)
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -162,15 +180,7 @@ async fn main() {
         info!("  shard[{}] -> {}", s.shard_id, s.address);
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(env_parse("SHARD_TIMEOUT_SECS", 5)))
-        // Fail fast on a shard that is down instead of spending the whole budget
-        .connect_timeout(Duration::from_millis(env_parse("SHARD_CONNECT_TIMEOUT_MS", 500)))
-        .pool_max_idle_per_host(env_parse("POOL_MAX_IDLE_PER_HOST", 64))
-        .build()
-        .expect("failed to build reqwest client");
-
-    let state = ProxyState { router, client };
+    let state = ProxyState { router, client: build_client() };
 
     // Match the shards' DefaultBodyLimit (64MB in src/api/server.rs). axum's
     // `Bytes` extractor (used by proxy_kv) otherwise caps request bodies at the
@@ -179,11 +189,7 @@ async fn main() {
     // never reach the shard — silently breaking pagination for big result sets.
     let max_body_bytes: usize = env_parse("MAX_BODY_BYTES", 64 * 1024 * 1024);
 
-    let app = Router::new()
-        .route("/health", get(|| async { "ok" }))
-        .route("/kv/*key", any(proxy_kv))
-        .layer(DefaultBodyLimit::max(max_body_bytes))
-        .with_state(state);
+    let app = build_app(state, max_body_bytes);
 
     let port = env_or("HTTP_PORT", "8080");
     let addr = format!("0.0.0.0:{port}");
@@ -193,3 +199,6 @@ async fn main() {
     info!("search-kv-proxy listening on {addr}");
     axum::serve(listener, app).await.expect("server error");
 }
+
+#[cfg(test)]
+mod tests;
