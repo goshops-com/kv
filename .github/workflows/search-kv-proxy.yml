@@ -35,6 +35,10 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # rustup es compartido entre los runners de stg: fijar la toolchain para que otro job no la cambie.
+  RUSTUP_TOOLCHAIN: '1.85'
+
 jobs:
   test:
     # Runner propio en stg (stg-kv). Los tests levantan shards falsos en 127.0.0.1: sin red ni cluster.
