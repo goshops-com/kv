@@ -65,11 +65,20 @@ jobs:
           cargo llvm-cov -p search-kv-proxy -p shard-router --all-targets --locked --summary-only \
             --fail-under-functions 98 --fail-under-lines 99 --fail-under-regions 90
 
+  # Imagen multi-arquitectura sin emulación: cada plataforma se buildea nativa en su runner
+  # (ubuntu-24.04-arm para arm64), se publica solo por digest y el job merge arma el manifest list con
+  # los tags. Prod (amd64) baja la variante amd64, que sale del mismo Dockerfile que antes.
   build:
     needs: test
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { platform: linux/amd64, runner: ubuntu-latest,    arch: amd64 }
+          - { platform: linux/arm64, runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -77,24 +86,86 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      # El cluster es amd64. Nunca :latest (prod lo usa con pullPolicy Always).
-      - uses: docker/build-push-action@v6
+      # Sin tags: se sube por digest; los tags los pone el job merge sobre el manifest list.
+      - id: build
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.proxy
-          platforms: linux/amd64
-          push: true
-          tags: |
-            goshops/search-kv-proxy:release-main
-            goshops/search-kv-proxy:main-${{ github.sha }}
-          cache-from: type=gha,scope=search-kv-proxy
-          cache-to: type=gha,mode=max,scope=search-kv-proxy
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=goshops/search-kv-proxy,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=search-kv-proxy-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=search-kv-proxy-${{ matrix.arch }}
+      - name: Guardar digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          printf '%s' "$DIGEST" > "$RUNNER_TEMP/digests/${{ matrix.arch }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-search-kv-proxy-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 1
+      # Smoke de la variante arm64 en el runner arm: que sea arm64 de verdad y que el binario arranque
+      # y responda (sin dependencias externas: lo que no hay, apunta a un puerto cerrado).
+      - name: Smoke arm64
+        if: matrix.arch == 'arm64'
+        env:
+          REF: goshops/search-kv-proxy@${{ steps.build.outputs.digest }}
+        run: |
+          docker pull "$REF"
+          arch=$(docker image inspect "$REF" --format '{{.Os}}/{{.Architecture}}')
+          echo "plataforma: $arch"
+          [ "$arch" = linux/arm64 ] || { echo "la imagen no es linux/arm64"; exit 1; }
+          docker run -d --name smoke -p 127.0.0.1:18080:8080 -e SHARD_ADDRESSES=127.0.0.1:9 "$REF"
+          ok=
+          for i in $(seq 1 60); do
+            if curl -fsS -m 2 http://127.0.0.1:18080/health; then ok=1; echo; break; fi
+            [ "$(docker inspect -f '{{.State.Running}}' smoke)" = true ] || break
+            sleep 1
+          done
+          docker logs smoke 2>&1 | tail -n 40
+          if docker logs smoke 2>&1 | grep -qi 'exec format error'; then echo "exec format error"; exit 1; fi
+          [ -n "$ok" ] || { echo "no respondió /health en :8080"; exit 1; }
+          docker rm -f smoke >/dev/null
+
+  # Manifest list amd64 + arm64 con los tags de siempre.
+  # Nunca :latest (prod lo usa con pullPolicy Always).
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digests-search-kv-proxy-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Manifest list
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          IMAGE: goshops/search-kv-proxy
+        run: |
+          docker buildx imagetools create -t "$IMAGE:main-${{ github.sha }}" -t "$IMAGE:release-main" \
+            "$IMAGE@$(cat amd64)" "$IMAGE@$(cat arm64)"
+          docker buildx imagetools inspect "$IMAGE:main-${{ github.sha }}"
+          platforms=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$IMAGE:main-${{ github.sha }}" \
+            | jq -r '[.manifests[].platform | select(.os == "linux") | "\(.os)/\(.architecture)"] | sort | join(",")')
+          echo "plataformas: $platforms"
+          [ "$platforms" = "linux/amd64,linux/arm64" ] || { echo "faltan plataformas"; exit 1; }
 
   # Deploy a prod con canary y rollback automático (.github/scripts/deploy-k8s.sh).
   # Variable de repo DEPLOY_MODE: "live" deploya; cualquier otro valor (o sin definir) = dry-run.
   # "[skip deploy]" en el mensaje del commit lo saltea.
   deploy:
-    needs: build
+    needs: merge
     if: >-
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
       && github.ref == 'refs/heads/main'
@@ -128,7 +199,7 @@ jobs:
         run: rm -f "$RUNNER_TEMP/kubeconfig"
 
   notify:
-    needs: [test, build, deploy]
+    needs: [test, build, merge, deploy]
     if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -138,6 +209,7 @@ jobs:
           WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
           TEST: ${{ needs.test.result }}
           BUILD: ${{ needs.build.result }}
+          MERGE: ${{ needs.merge.result }}
           DEPLOY: ${{ needs.deploy.result }}
           DEPLOY_MODE: ${{ vars.DEPLOY_MODE }}
           REPO: ${{ github.repository }}
@@ -149,6 +221,7 @@ jobs:
           [ -n "$WEBHOOK" ] || { echo "sin DISCORD_WEBHOOK_URL"; exit 0; }
           if [ "$TEST" != success ]; then status="❌ tests: $TEST"; color=15548997
           elif [ "$BUILD" != success ]; then status="❌ build: $BUILD"; color=15548997
+          elif [ "$MERGE" != success ]; then status="❌ manifest multi-arch: $MERGE"; color=15548997
           elif [ "$DEPLOY" = failure ]; then status="❌ deploy a prod falló → rollback automático (ver corrida)"; color=15548997
           elif [ "$DEPLOY" = success ] && [ "$DEPLOY_MODE" = live ]; then status="🚀 deployado a prod: \`main-${SHA:0:7}\`"; color=5763719
           elif [ "$DEPLOY" = success ]; then status="✅ imagen publicada \`main-${SHA:0:7}\` (deploy en dry-run, prod sin cambios)"; color=5763719
