@@ -79,6 +79,11 @@ jobs:
           - { platform: linux/arm64, runner: ubuntu-24.04-arm, arch: arm64 }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    # Cada pierna escribe solo su clave (digest-amd64 / digest-arm64) y merge recibe las dos por outputs:
+    # sin artifacts, porque la cuota de artifacts de la org se llena y corta el upload.
+    outputs:
+      digest-amd64: ${{ steps.digest.outputs.digest-amd64 }}
+      digest-arm64: ${{ steps.digest.outputs.digest-arm64 }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -89,6 +94,8 @@ jobs:
       # Sin tags: se sube por digest; los tags los pone el job merge sobre el manifest list.
       - id: build
         uses: docker/build-push-action@v6
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: 'false'
         with:
           context: .
           file: Dockerfile.proxy
@@ -96,18 +103,13 @@ jobs:
           outputs: type=image,name=goshops/search-kv-proxy,push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=search-kv-proxy-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=search-kv-proxy-${{ matrix.arch }}
-      - name: Guardar digest
+      - id: digest
+        name: Digest
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
-          mkdir -p "$RUNNER_TEMP/digests"
-          printf '%s' "$DIGEST" > "$RUNNER_TEMP/digests/${{ matrix.arch }}"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: digests-search-kv-proxy-${{ matrix.arch }}
-          path: ${{ runner.temp }}/digests/${{ matrix.arch }}
-          if-no-files-found: error
-          retention-days: 1
+          [[ "$DIGEST" == sha256:* ]] || { echo "sin digest"; exit 1; }
+          echo "digest-${{ matrix.arch }}=$DIGEST" >> "$GITHUB_OUTPUT"
       # Smoke de la variante arm64 en el runner arm: que sea arm64 de verdad y que el binario arranque
       # y responda (sin dependencias externas: lo que no hay, apunta a un puerto cerrado).
       - name: Smoke arm64
@@ -138,23 +140,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: digests-search-kv-proxy-*
-          path: ${{ runner.temp }}/digests
-          merge-multiple: true
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Manifest list
-        working-directory: ${{ runner.temp }}/digests
         env:
+          AMD64: ${{ needs.build.outputs.digest-amd64 }}
+          ARM64: ${{ needs.build.outputs.digest-arm64 }}
           IMAGE: goshops/search-kv-proxy
         run: |
+          echo "amd64=$AMD64 arm64=$ARM64"
+          [[ "$AMD64" == sha256:* && "$ARM64" == sha256:* ]] || { echo "falta un digest"; exit 1; }
           docker buildx imagetools create -t "$IMAGE:main-${{ github.sha }}" -t "$IMAGE:release-main" \
-            "$IMAGE@$(cat amd64)" "$IMAGE@$(cat arm64)"
+            "$IMAGE@$AMD64" "$IMAGE@$ARM64"
           docker buildx imagetools inspect "$IMAGE:main-${{ github.sha }}"
           platforms=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$IMAGE:main-${{ github.sha }}" \
             | jq -r '[.manifests[].platform | select(.os == "linux") | "\(.os)/\(.architecture)"] | sort | join(",")')
